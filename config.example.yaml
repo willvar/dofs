@@ -1,0 +1,40 @@
+version: 1
+state_root: /var/lib/dofs
+
+metadata:
+  driver: sqlite
+  sqlite:
+    path: /var/lib/dofs/metadata.sqlite
+    busy_timeout_seconds: 5
+    max_open_connections: 8
+  # PostgreSQL is available through the optional PostgreSQL distribution.
+  # postgres:
+  #   dsn:
+  #     env: DOFS_POSTGRES_DSN
+
+object:
+  driver: s3
+  s3:
+    endpoint: s3.example.com
+    bucket: encrypted-files
+    region: us-east-1
+    prefix: dofs/production
+    secure: true
+    access_key:
+      env: DOFS_S3_ACCESS_KEY
+    secret_key:
+      env: DOFS_S3_SECRET_KEY
+    session_token: {}
+
+encryption:
+  # Generate once with: openssl rand -hex 32
+  master_key:
+    env: DOFS_MASTER_KEY
+
+mount:
+  root: /mnt/dofs
+  writable: true
+  allow_other: false
+  uid: 0
+  gid: 0
+  debug: false

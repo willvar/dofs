@@ -1,0 +1,27 @@
+[Unit]
+Description=Initialize DOFS metadata
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/dofs/config.yaml
+
+[Service]
+Type=oneshot
+User=dofs
+Group=dofs
+UMask=0077
+EnvironmentFile=-/etc/dofs/dofs.env
+StateDirectory=dofs
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/dofsd init --config /etc/dofs/config.yaml
+RemainAfterExit=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/dofs
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

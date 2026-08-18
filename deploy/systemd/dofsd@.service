@@ -1,0 +1,37 @@
+[Unit]
+Description=DOFS namespace mount %i
+Requires=dofs-init.service
+After=dofs-init.service network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/dofs/config.yaml
+RequiresMountsFor=/var/lib/dofs /mnt/dofs
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=dofs
+Group=dofs
+UMask=0077
+EnvironmentFile=-/etc/dofs/dofs.env
+StateDirectory=dofs
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/dofsd mount --config /etc/dofs/config.yaml --namespace %i
+Restart=on-failure
+RestartSec=3s
+KillSignal=SIGTERM
+TimeoutStartSec=90s
+TimeoutStopSec=45s
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+LimitNOFILE=1048576
+LimitCORE=0
+
+# The FUSE mount must be created in the host mount namespace so Docker and
+# ordinary host services can consume it. Do not add PrivateTmp, ProtectSystem,
+# ProtectHome, RootDirectory, BindPaths, InaccessiblePaths, or other
+# filesystem-namespace directives. NoNewPrivileges is also intentionally
+# omitted because an unprivileged service uses the setuid fusermount3 helper.
+PrivateMounts=no
+
+[Install]
+WantedBy=multi-user.target

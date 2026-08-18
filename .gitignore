@@ -1,0 +1,11 @@
+/bin/
+/dist/
+/tmp/
+*.test
+*.out
+config.yaml
+bin/
+dist/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
