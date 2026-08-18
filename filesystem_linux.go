@@ -21,6 +21,10 @@ type fuseNode struct {
 	backend *Backend
 	nodeMu  sync.RWMutex
 	node    Node
+
+	writeMu       sync.Mutex
+	activeWrite   *WriteSession
+	activeWriters int
 }
 
 func newFuseRoot(backend *Backend, root Node) *fuseNode {
@@ -39,6 +43,60 @@ func (n *fuseNode) setNode(node Node) {
 	n.nodeMu.Lock()
 	n.node = node
 	n.nodeMu.Unlock()
+}
+
+// acquireWrite shares one uncommitted plaintext view between every handle for
+// an inode. POSIX requires writes through one descriptor to be immediately
+// visible through another descriptor, before fsync or close. Keeping separate
+// WriteSessions here would make applications that reopen their output while
+// writing (for example FFmpeg's faststart pass) read the previous generation.
+func (n *fuseNode) acquireWrite(ctx context.Context) (*WriteSession, error) {
+	n.writeMu.Lock()
+	defer n.writeMu.Unlock()
+	if n.activeWrite == nil {
+		session, err := n.backend.OpenWrite(ctx, n.snapshot(), n.setNode)
+		if err != nil {
+			return nil, err
+		}
+		n.activeWrite = session
+	}
+	n.activeWriters++
+	return n.activeWrite, nil
+}
+
+func (n *fuseNode) releaseWrite(ctx context.Context, session *WriteSession) error {
+	n.writeMu.Lock()
+	defer n.writeMu.Unlock()
+	if session == nil || n.activeWrite != session || n.activeWriters <= 0 {
+		return ErrHandleClosed
+	}
+	n.activeWriters--
+	if n.activeWriters > 0 {
+		return session.Commit(ctx)
+	}
+	err := session.Close(ctx)
+	n.activeWrite = nil
+	return err
+}
+
+func (n *fuseNode) readActive(ctx context.Context, destination []byte, offset int64) (int, bool, error) {
+	n.writeMu.Lock()
+	defer n.writeMu.Unlock()
+	if n.activeWrite == nil {
+		return 0, false, nil
+	}
+	read, err := n.activeWrite.ReadAt(ctx, destination, offset)
+	return read, true, err
+}
+
+func (n *fuseNode) activeSize() (int64, bool, error) {
+	n.writeMu.Lock()
+	defer n.writeMu.Unlock()
+	if n.activeWrite == nil {
+		return 0, false, nil
+	}
+	size, err := n.activeWrite.Size()
+	return size, true, err
 }
 
 func stableAttr(node Node) fs.StableAttr {
@@ -76,7 +134,15 @@ func (n *fuseNode) Getattr(ctx context.Context, handle fs.FileHandle, out *fuse.
 	if file, ok := handle.(*fileHandle); ok {
 		return file.Getattr(ctx, out)
 	}
-	fillAttr(&out.Attr, n.snapshot(), n.backend.Writable())
+	node := n.snapshot()
+	fillAttr(&out.Attr, node, n.backend.Writable())
+	if node.IsFile() {
+		if size, active, err := n.activeSize(); err != nil {
+			return errno(err)
+		} else if active {
+			out.Size = uint64(size)
+		}
+	}
 	return 0
 }
 
@@ -224,7 +290,11 @@ func (n *fuseNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 			return nil, 0, errno(err)
 		}
 		if err := writeSession.Truncate(ctx, 0); err != nil {
-			writeSession.Abort()
+			if handle.sharedWrite {
+				_ = n.releaseWrite(ctx, writeSession)
+			} else {
+				writeSession.Abort()
+			}
 			_ = n.backend.release(context.Background(), node.Inode)
 			return nil, 0, errno(err)
 		}
@@ -257,15 +327,15 @@ func (n *fuseNode) Setattr(ctx context.Context, handle fs.FileHandle, input *fus
 			return errno(err)
 		}
 		defer func() { _ = n.backend.release(context.Background(), node.Inode) }()
-		session, err := n.backend.OpenWrite(ctx, node, n.setNode)
+		session, err := n.acquireWrite(ctx)
 		if err != nil {
 			return errno(err)
 		}
 		if err := session.Truncate(ctx, int64(size)); err != nil {
-			session.Abort()
+			_ = n.releaseWrite(ctx, session)
 			return errno(err)
 		}
-		if err := session.Close(ctx); err != nil {
+		if err := n.releaseWrite(ctx, session); err != nil {
 			return errno(err)
 		}
 		node = n.snapshot()
@@ -275,15 +345,16 @@ func (n *fuseNode) Setattr(ctx context.Context, handle fs.FileHandle, input *fus
 }
 
 type fileHandle struct {
-	backend    *Backend
-	node       *fuseNode
-	metadata   Node
-	writable   bool
-	writeMu    sync.Mutex
-	write      *WriteSession
-	retained   bool
-	release    sync.Once
-	releaseErr syscall.Errno
+	backend     *Backend
+	node        *fuseNode
+	metadata    Node
+	writable    bool
+	writeMu     sync.Mutex
+	write       *WriteSession
+	sharedWrite bool
+	retained    bool
+	release     sync.Once
+	releaseErr  syscall.Errno
 }
 
 func (h *fileHandle) ensureWrite(ctx context.Context) (*WriteSession, error) {
@@ -295,19 +366,20 @@ func (h *fileHandle) ensureWrite(ctx context.Context) (*WriteSession, error) {
 	if !h.writable {
 		return nil, ErrReadOnly
 	}
-	node := h.metadata
 	if h.node != nil {
-		node = h.node.snapshot()
+		writeSession, err := h.node.acquireWrite(ctx)
+		if err != nil {
+			return nil, err
+		}
+		h.metadata = h.node.snapshot()
+		h.write = writeSession
+		h.sharedWrite = true
+		return writeSession, nil
 	}
-	var onCommit func(Node)
-	if h.node != nil {
-		onCommit = h.node.setNode
-	}
-	writeSession, err := h.backend.OpenWrite(ctx, node, onCommit)
+	writeSession, err := h.backend.OpenWrite(ctx, h.metadata, nil)
 	if err != nil {
 		return nil, err
 	}
-	h.metadata = node
 	h.write = writeSession
 	return writeSession, nil
 }
@@ -334,7 +406,20 @@ func (h *fileHandle) Read(ctx context.Context, destination []byte, offset int64)
 		}
 		return fuse.ReadResultData(destination[:read]), 0
 	}
-	data, err := h.backend.ReadAt(ctx, h.metadata, offset, len(destination))
+	if h.node != nil {
+		read, active, err := h.node.readActive(ctx, destination, offset)
+		if active {
+			if err != nil && !errors.Is(err, io.EOF) {
+				return nil, errno(err)
+			}
+			return fuse.ReadResultData(destination[:read]), 0
+		}
+	}
+	metadata := h.metadata
+	if h.node != nil {
+		metadata = h.node.snapshot()
+	}
+	data, err := h.backend.ReadAt(ctx, metadata, offset, len(destination))
 	if err != nil {
 		return nil, errno(err)
 	}
@@ -363,7 +448,11 @@ func (h *fileHandle) Fsync(ctx context.Context, _ uint32) syscall.Errno { return
 func (h *fileHandle) Release(ctx context.Context) syscall.Errno {
 	h.release.Do(func() {
 		if writeSession := h.writeSession(); writeSession != nil {
-			h.releaseErr = errno(writeSession.Close(ctx))
+			if h.sharedWrite && h.node != nil {
+				h.releaseErr = errno(h.node.releaseWrite(ctx, writeSession))
+			} else {
+				h.releaseErr = errno(writeSession.Close(ctx))
+			}
 		}
 		if h.retained {
 			if releaseErr := errno(h.backend.release(context.Background(), h.metadata.Inode)); h.releaseErr == 0 {
@@ -387,6 +476,12 @@ func (h *fileHandle) Getattr(_ context.Context, out *fuse.AttrOut) syscall.Errno
 			return errno(err)
 		}
 		out.Size = uint64(size)
+	} else if h.node != nil {
+		if size, active, err := h.node.activeSize(); err != nil {
+			return errno(err)
+		} else if active {
+			out.Size = uint64(size)
+		}
 	}
 	return 0
 }

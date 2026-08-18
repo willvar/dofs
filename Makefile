@@ -20,7 +20,7 @@ test-postgres:
 	cd integration/postgres && GOWORK=off $(GO) test ./...
 
 test-fuse:
-	DOFS_FUSE_INTEGRATION=1 $(GO) test . -run TestRealFUSEMarvoAtomicIOContract -v -count=1
+	DOFS_FUSE_INTEGRATION=1 $(GO) test . -run '^TestRealFUSE' -v -count=1
 
 test-docker:
 	DOFS_DOCKER_INTEGRATION=1 $(GO) test . -run TestFUSEBindMountIntoDocker -v -count=1

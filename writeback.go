@@ -402,8 +402,9 @@ func openRegularFile(filePath string) (*os.File, error) {
 	return os.OpenFile(filePath, os.O_RDWR, 0600)
 }
 
-// WriteSession is an isolated plaintext snapshot for one open file handle.
-// Concurrent writers are detected by the generation CAS during Commit.
+// WriteSession is an isolated plaintext snapshot for one inode writer. The
+// FUSE adapter shares it across concurrent handles for that inode; independent
+// backend callers are still protected by the generation CAS during Commit.
 type WriteSession struct {
 	manager      *WritebackManager
 	cache        *os.File
