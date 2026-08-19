@@ -198,6 +198,9 @@ func (s *Store) RefreshExternalUpload(ctx context.Context, namespaceID, uploadID
 	upload, err := scanExternalUpload(s.db.QueryRowContext(ctx, `UPDATE dofs_external_uploads
         SET expires_at = $3 WHERE namespace_id = $1 AND upload_id = $2
         AND state = 'active' AND expires_at > CURRENT_TIMESTAMP
+        AND EXISTS(SELECT 1 FROM dofs_nodes
+            WHERE namespace_id = dofs_external_uploads.namespace_id
+            AND inode = dofs_external_uploads.inode AND state IN ('creating', 'ready'))
         RETURNING `+externalUploadColumns, namespaceID, uploadID, expiresAt.UTC()))
 	return upload, mapError(err)
 }

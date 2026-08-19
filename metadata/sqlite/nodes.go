@@ -54,13 +54,13 @@ func (s *Store) GetNamespace(ctx context.Context, id string) (dofs.Namespace, er
 		return dofs.Namespace{}, err
 	}
 	return scanNamespace(s.db.QueryRowContext(ctx, `
-        SELECT id, label, wrapped_kek, quota_bytes, used_bytes, created_at, updated_at
+        SELECT id, label, wrapped_kek, quota_bytes, used_bytes, pending_reclaim_bytes, created_at, updated_at
         FROM dofs_namespaces WHERE id = ?`, id))
 }
 
 func (s *Store) ListNamespaces(ctx context.Context) ([]dofs.Namespace, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, label, wrapped_kek, quota_bytes,
-        used_bytes, created_at, updated_at FROM dofs_namespaces ORDER BY id`)
+        used_bytes, pending_reclaim_bytes, created_at, updated_at FROM dofs_namespaces ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("list DOFS SQLite namespaces: %w", err)
 	}
@@ -305,7 +305,7 @@ func scanNamespace(row scanner) (dofs.Namespace, error) {
 	var createdAt, updatedAt int64
 	if err := row.Scan(
 		&namespace.ID, &namespace.Label, &namespace.WrappedKEK, &namespace.QuotaBytes,
-		&namespace.UsedBytes, &createdAt, &updatedAt,
+		&namespace.UsedBytes, &namespace.PendingReclaimBytes, &createdAt, &updatedAt,
 	); err != nil {
 		return dofs.Namespace{}, mapError(err)
 	}

@@ -68,6 +68,15 @@ func (s *Store) Migrate(ctx context.Context) error {
 		if _, err := tx.ExecContext(ctx, `UPDATE dofs_schema SET version = 2 WHERE singleton = TRUE`); err != nil {
 			return fmt.Errorf("record DOFS metadata schema v2: %w", err)
 		}
+		current = 2
+	}
+	if current < 3 {
+		if _, err := tx.ExecContext(ctx, createReclamationSchema); err != nil {
+			return fmt.Errorf("install DOFS metadata schema v3: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE dofs_schema SET version = 3 WHERE singleton = TRUE`); err != nil {
+			return fmt.Errorf("record DOFS metadata schema v3: %w", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit DOFS schema migration: %w", err)
@@ -90,7 +99,7 @@ func (s *Store) CreateNamespace(ctx context.Context, namespace dofs.Namespace) (
 	row := tx.QueryRowContext(ctx, `
         INSERT INTO dofs_namespaces(id, label, wrapped_kek, quota_bytes)
         VALUES ($1, $2, $3, $4)
-        RETURNING id, label, wrapped_kek, quota_bytes, used_bytes, created_at, updated_at`,
+        RETURNING id, label, wrapped_kek, quota_bytes, used_bytes, pending_reclaim_bytes, created_at, updated_at`,
 		namespace.ID, namespace.Label, namespace.WrappedKEK, namespace.QuotaBytes,
 	)
 	created, err := scanNamespace(row)
@@ -117,13 +126,13 @@ func (s *Store) GetNamespace(ctx context.Context, id string) (dofs.Namespace, er
 		return dofs.Namespace{}, err
 	}
 	return scanNamespace(s.db.QueryRowContext(ctx, `
-        SELECT id, label, wrapped_kek, quota_bytes, used_bytes, created_at, updated_at
+        SELECT id, label, wrapped_kek, quota_bytes, used_bytes, pending_reclaim_bytes, created_at, updated_at
         FROM dofs_namespaces WHERE id = $1`, id))
 }
 
 func (s *Store) ListNamespaces(ctx context.Context) ([]dofs.Namespace, error) {
 	rows, err := s.db.QueryContext(ctx, `
-        SELECT id, label, wrapped_kek, quota_bytes, used_bytes, created_at, updated_at
+        SELECT id, label, wrapped_kek, quota_bytes, used_bytes, pending_reclaim_bytes, created_at, updated_at
         FROM dofs_namespaces ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("list DOFS namespaces: %w", err)
@@ -156,6 +165,13 @@ func (s *Store) DeleteNamespace(ctx context.Context, id string) error {
 	}
 	if !acquired {
 		return dofs.ErrWriterBusy
+	}
+	reclaimKey := "dofs:v1:reclaim:" + id
+	if err := tx.QueryRowContext(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))`, reclaimKey).Scan(&acquired); err != nil {
+		return fmt.Errorf("lock DOFS namespace reclamation: %w", err)
+	}
+	if !acquired {
+		return dofs.ErrReclaimBusy
 	}
 	result, err := tx.ExecContext(ctx, `DELETE FROM dofs_namespaces WHERE id = $1`, id)
 	if err != nil {
@@ -390,7 +406,7 @@ func scanNamespace(row scanner) (dofs.Namespace, error) {
 	var namespace dofs.Namespace
 	err := row.Scan(
 		&namespace.ID, &namespace.Label, &namespace.WrappedKEK, &namespace.QuotaBytes,
-		&namespace.UsedBytes, &namespace.CreatedAt, &namespace.UpdatedAt,
+		&namespace.UsedBytes, &namespace.PendingReclaimBytes, &namespace.CreatedAt, &namespace.UpdatedAt,
 	)
 	if err != nil {
 		return dofs.Namespace{}, mapError(err)

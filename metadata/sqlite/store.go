@@ -209,6 +209,17 @@ func (s *Store) Migrate(ctx context.Context) error {
 		if _, err := tx.ExecContext(ctx, `UPDATE dofs_schema SET version = 2 WHERE singleton = 1`); err != nil {
 			return fmt.Errorf("record DOFS SQLite schema v2: %w", err)
 		}
+		current = 2
+	}
+	if current < 3 {
+		for _, statement := range schemaV3Statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("install DOFS SQLite schema v3: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE dofs_schema SET version = 3 WHERE singleton = 1`); err != nil {
+			return fmt.Errorf("record DOFS SQLite schema v3: %w", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit DOFS SQLite migration: %w", err)
@@ -247,6 +258,13 @@ func (s *Store) DeleteNamespace(ctx context.Context, id string) error {
 	}
 	if liveLease != 0 {
 		return dofs.ErrWriterBusy
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM dofs_reclamation_leases
+        WHERE namespace_id = ? AND expires_at > ?`, id, millis(now)).Scan(&liveLease); err != nil {
+		return err
+	}
+	if liveLease != 0 {
+		return dofs.ErrReclaimBusy
 	}
 	result, err := tx.ExecContext(ctx, `DELETE FROM dofs_namespaces WHERE id = ?`, id)
 	if err != nil {

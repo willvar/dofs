@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -41,12 +42,12 @@ func (s *Store) CommitGeneration(ctx context.Context, request dofs.CommitGenerat
 	if node.Generation != request.ExpectedGeneration {
 		return node, false, nil
 	}
-	var quota, used int64
-	if err := tx.QueryRowContext(ctx, `SELECT quota_bytes, used_bytes FROM dofs_namespaces WHERE id = $1`, request.NamespaceID).Scan(&quota, &used); err != nil {
+	var quota, used, pending int64
+	if err := tx.QueryRowContext(ctx, `SELECT quota_bytes, used_bytes, pending_reclaim_bytes FROM dofs_namespaces WHERE id = $1`, request.NamespaceID).Scan(&quota, &used, &pending); err != nil {
 		return dofs.Node{}, false, mapError(err)
 	}
 	delta := request.Size - node.Size
-	if quota > 0 && delta > 0 && used+delta > quota {
+	if delta > 0 && (used > math.MaxInt64-delta || (quota > 0 && delta > quota-used)) {
 		return node, false, dofs.ErrQuotaExceeded
 	}
 	nextGeneration := node.Generation + 1
@@ -73,10 +74,22 @@ func (s *Store) CommitGeneration(ctx context.Context, request dofs.CommitGenerat
 	if err != nil {
 		return dofs.Node{}, false, err
 	}
+	nextUsed, nextPending := used, pending
+	if node.State == dofs.NodeStateDeleted {
+		if (delta < 0 && pending < -delta) || (delta > 0 && pending > math.MaxInt64-delta) {
+			return dofs.Node{}, false, errors.New("dofs: corrupt pending reclaim usage")
+		}
+		nextPending = pending + delta
+	} else {
+		if delta < 0 && used < -delta {
+			return dofs.Node{}, false, errors.New("dofs: corrupt namespace usage")
+		}
+		nextUsed = used + delta
+	}
 	if _, err := tx.ExecContext(ctx, `
         UPDATE dofs_namespaces
-        SET used_bytes = used_bytes + $2, updated_at = CURRENT_TIMESTAMP
-        WHERE id = $1`, request.NamespaceID, delta); err != nil {
+        SET used_bytes = $2, pending_reclaim_bytes = $3, updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1`, request.NamespaceID, nextUsed, nextPending); err != nil {
 		return dofs.Node{}, false, fmt.Errorf("update DOFS namespace usage: %w", err)
 	}
 	kind := dofs.EventWrite
@@ -190,6 +203,9 @@ func (s *Store) Rename(ctx context.Context, request dofs.RenameRequest) (dofs.No
 		}); err != nil {
 			return dofs.Node{}, nil, err
 		}
+		if err := moveUsageToPending(ctx, tx, request.NamespaceID, destination.Size); err != nil {
+			return dofs.Node{}, nil, err
+		}
 		replaced = &replacedNode
 	} else if !errors.Is(destinationErr, dofs.ErrNotFound) {
 		return dofs.Node{}, nil, destinationErr
@@ -270,6 +286,9 @@ func (s *Store) Remove(ctx context.Context, request dofs.RemoveRequest) (dofs.No
 	if err != nil {
 		return dofs.Node{}, err
 	}
+	if err := moveUsageToPending(ctx, tx, request.NamespaceID, node.Size); err != nil {
+		return dofs.Node{}, err
+	}
 	if err := insertEvent(ctx, tx, dofs.Event{
 		NamespaceID: node.NamespaceID, Kind: dofs.EventRemove, Inode: node.Inode,
 		Generation: node.Generation, OldParent: oldParent, OldName: oldName,
@@ -282,9 +301,12 @@ func (s *Store) Remove(ctx context.Context, request dofs.RemoveRequest) (dofs.No
 	return node, nil
 }
 
-func (s *Store) Purge(ctx context.Context, namespaceID string, inode uint64) (bool, error) {
+func (s *Store) Purge(ctx context.Context, namespaceID string, inode uint64, expectedGeneration int64) (bool, error) {
 	if err := dofs.ValidateNamespaceID(namespaceID); err != nil {
 		return false, err
+	}
+	if expectedGeneration < 0 {
+		return false, nil
 	}
 	tx, err := s.begin(ctx)
 	if err != nil {
@@ -306,6 +328,18 @@ func (s *Store) Purge(ctx context.Context, namespaceID string, inode uint64) (bo
 	if node.State != dofs.NodeStateDeleted {
 		return false, dofs.ErrConflict
 	}
+	if node.Generation != expectedGeneration {
+		return false, dofs.ErrConflict
+	}
+	var liveUpload bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM dofs_external_uploads
+        WHERE namespace_id = $1 AND inode = $2 AND state = 'active' AND expires_at > CURRENT_TIMESTAMP)`,
+		namespaceID, inode).Scan(&liveUpload); err != nil {
+		return false, err
+	}
+	if liveUpload {
+		return false, dofs.ErrConflict
+	}
 	if node.IsDir() {
 		var nonempty bool
 		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM dofs_nodes WHERE namespace_id = $1 AND parent_inode = $2)`, namespaceID, inode).Scan(&nonempty); err != nil {
@@ -318,16 +352,43 @@ func (s *Store) Purge(ctx context.Context, namespaceID string, inode uint64) (bo
 	if _, err := tx.ExecContext(ctx, `DELETE FROM dofs_nodes WHERE namespace_id = $1 AND inode = $2`, namespaceID, inode); err != nil {
 		return false, fmt.Errorf("purge DOFS inode: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `
+	result, err := tx.ExecContext(ctx, `
         UPDATE dofs_namespaces
-        SET used_bytes = used_bytes - $2, updated_at = CURRENT_TIMESTAMP
-        WHERE id = $1`, namespaceID, node.Size); err != nil {
-		return false, fmt.Errorf("release DOFS namespace usage: %w", err)
+        SET pending_reclaim_bytes = pending_reclaim_bytes - $2, updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1 AND pending_reclaim_bytes >= $2`, namespaceID, node.Size)
+	if err != nil {
+		return false, fmt.Errorf("release DOFS pending reclaim usage: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected != 1 {
+		return false, errors.New("dofs: corrupt pending reclaim usage")
 	}
 	if err := tx.Commit(); err != nil {
 		return false, mapError(err)
 	}
 	return true, nil
+}
+
+func moveUsageToPending(ctx context.Context, tx *sql.Tx, namespaceID string, size int64) error {
+	result, err := tx.ExecContext(ctx, `UPDATE dofs_namespaces
+        SET used_bytes = used_bytes - $2,
+            pending_reclaim_bytes = pending_reclaim_bytes + $2,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1 AND used_bytes >= $2`, namespaceID, size)
+	if err != nil {
+		return fmt.Errorf("detach DOFS namespace usage: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return errors.New("dofs: corrupt namespace usage")
+	}
+	return nil
 }
 
 func (s *Store) ListGenerations(ctx context.Context, namespaceID string, inode uint64) ([]dofs.Generation, error) {
@@ -368,6 +429,44 @@ func (s *Store) ListGenerations(ctx context.Context, namespaceID string, inode u
 		}
 	}
 	return result, nil
+}
+
+func (s *Store) DeleteGeneration(ctx context.Context, namespaceID string, inode uint64, number int64) (bool, error) {
+	if err := dofs.ValidateNamespaceID(namespaceID); err != nil {
+		return false, err
+	}
+	if inode == 0 || number <= 0 {
+		return false, nil
+	}
+	tx, err := s.begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	if err := lockNamespace(ctx, tx, namespaceID); err != nil {
+		return false, err
+	}
+	var current int64
+	if err := tx.QueryRowContext(ctx, `SELECT generation FROM dofs_nodes
+        WHERE namespace_id = $1 AND inode = $2 FOR UPDATE`, namespaceID, inode).Scan(&current); err != nil {
+		return false, mapError(err)
+	}
+	if number >= current {
+		return false, dofs.ErrConflict
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM dofs_generations
+        WHERE namespace_id = $1 AND inode = $2 AND number = $3`, namespaceID, inode, number)
+	if err != nil {
+		return false, mapError(err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, mapError(err)
+	}
+	return affected == 1, nil
 }
 
 func (s *Store) ListState(ctx context.Context, namespaceID string, state dofs.NodeState) ([]dofs.Node, error) {
@@ -479,48 +578,72 @@ func (s *Store) LatestEventSequence(ctx context.Context, namespaceID string) (in
 }
 
 func (s *Store) AcquireWriterLease(ctx context.Context, namespaceID string) (dofs.Lease, error) {
+	return s.acquireAdvisoryLease(ctx, namespaceID, "dofs:v1:writer:"+namespaceID, false, dofs.ErrWriterBusy, "writer")
+}
+
+func (s *Store) AcquireMountLease(ctx context.Context, namespaceID string) (dofs.Lease, error) {
+	return s.acquireAdvisoryLease(ctx, namespaceID, "dofs:v1:reclaim:"+namespaceID, false, dofs.ErrMountBusy, "mount")
+}
+
+func (s *Store) AcquireReclaimLease(ctx context.Context, namespaceID string) (dofs.Lease, error) {
+	return s.acquireAdvisoryLease(ctx, namespaceID, "dofs:v1:reclaim:"+namespaceID, false, dofs.ErrReclaimBusy, "reclamation")
+}
+
+func (s *Store) acquireAdvisoryLease(
+	ctx context.Context,
+	namespaceID, key string,
+	shared bool,
+	busyError error,
+	label string,
+) (dofs.Lease, error) {
 	if err := dofs.ValidateNamespaceID(namespaceID); err != nil {
 		return nil, err
 	}
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("reserve DOFS writer connection: %w", err)
+		return nil, fmt.Errorf("reserve DOFS %s lease connection: %w", label, err)
 	}
 	var exists bool
 	if err := conn.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM dofs_namespaces WHERE id = $1)`, namespaceID).Scan(&exists); err != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("verify DOFS writer namespace: %w", err)
+		return nil, fmt.Errorf("verify DOFS %s lease namespace: %w", label, err)
 	}
 	if !exists {
 		_ = conn.Close()
 		return nil, dofs.ErrNotFound
 	}
-	key := "dofs:v1:writer:" + namespaceID
 	var acquired bool
-	if err := conn.QueryRowContext(ctx, `SELECT pg_try_advisory_lock(hashtextextended($1, 0))`, key).Scan(&acquired); err != nil {
+	query := `SELECT pg_try_advisory_lock(hashtextextended($1, 0))`
+	if shared {
+		query = `SELECT pg_try_advisory_lock_shared(hashtextextended($1, 0))`
+	}
+	if err := conn.QueryRowContext(ctx, query, key).Scan(&acquired); err != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("acquire DOFS writer lease: %w", err)
+		return nil, fmt.Errorf("acquire DOFS %s lease: %w", label, err)
 	}
 	if !acquired {
 		_ = conn.Close()
-		return nil, dofs.ErrWriterBusy
+		return nil, busyError
 	}
 	lease := &writerLease{
-		conn: conn, key: key, lost: make(chan struct{}), stop: make(chan struct{}), done: make(chan struct{}),
+		conn: conn, key: key, shared: shared, label: label,
+		lost: make(chan struct{}), stop: make(chan struct{}), done: make(chan struct{}),
 	}
 	go lease.monitor()
 	return lease, nil
 }
 
 type writerLease struct {
-	mu   sync.Mutex
-	conn *sql.Conn
-	key  string
-	lost chan struct{}
-	stop chan struct{}
-	done chan struct{}
-	once sync.Once
-	err  error
+	mu     sync.Mutex
+	conn   *sql.Conn
+	key    string
+	shared bool
+	label  string
+	lost   chan struct{}
+	stop   chan struct{}
+	done   chan struct{}
+	once   sync.Once
+	err    error
 }
 
 func (l *writerLease) Lost() <-chan struct{} { return l.lost }
@@ -555,7 +678,7 @@ func (l *writerLease) monitor() {
 			}
 			cancel()
 			if err != nil {
-				l.err = fmt.Errorf("DOFS writer lease lost: %w", err)
+				l.err = fmt.Errorf("DOFS %s lease lost: %w", l.label, err)
 				select {
 				case <-l.lost:
 				default:
@@ -584,12 +707,16 @@ func (l *writerLease) Close() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		var released bool
-		if err := l.conn.QueryRowContext(ctx, `SELECT pg_advisory_unlock(hashtextextended($1, 0))`, l.key).Scan(&released); err != nil {
+		query := `SELECT pg_advisory_unlock(hashtextextended($1, 0))`
+		if l.shared {
+			query = `SELECT pg_advisory_unlock_shared(hashtextextended($1, 0))`
+		}
+		if err := l.conn.QueryRowContext(ctx, query, l.key).Scan(&released); err != nil {
 			if l.err == nil {
 				l.err = err
 			}
 		} else if !released && l.err == nil {
-			l.err = errors.New("DOFS writer lease was not held")
+			l.err = fmt.Errorf("DOFS %s lease was not held", l.label)
 		}
 		if err := l.conn.Close(); err != nil && l.err == nil {
 			l.err = err

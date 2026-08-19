@@ -30,6 +30,18 @@ type Store struct {
 	prefix string
 }
 
+// VersioningStatus returns the provider's bucket versioning state. An empty
+// status means versioning has never been enabled under the S3 API; "Enabled"
+// and "Suspended" both require noncurrent-version lifecycle handling when
+// physical deletion must reduce billed storage.
+func (s *Store) VersioningStatus(ctx context.Context) (string, error) {
+	configuration, err := s.client.GetBucketVersioning(ctx, s.bucket)
+	if err != nil {
+		return "", mapError(err)
+	}
+	return configuration.Status, nil
+}
+
 func (s *Store) Check(ctx context.Context) error {
 	exists, err := s.client.BucketExists(ctx, s.bucket)
 	if err != nil {

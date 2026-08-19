@@ -36,7 +36,12 @@ is an immutable encrypted object.
   already-existing key before upload, and rely on metadata CAS for atomic
   publication; they do not require MinIO's non-standard conditional PUT.
 - One writable FUSE owner per namespace, with lease-loss detection.
+- One exclusive mount lease per namespace fences physical reclamation and makes
+  that mount's handle registry authoritative for open-file Unix semantics.
 - Namespace quotas, durable change events and stable inode identity.
+- Permanent unlink immediately releases logical quota into a durable
+  `pending_reclaim_bytes` backlog; idempotent reclamation deletes every
+  encrypted generation and survives process or object-store failures.
 - A direct-upload reservation API: a browser or application can upload
   ciphertext straight to object storage and publish it without proxying the
   payload through its control server.
@@ -191,6 +196,9 @@ Applications that also have a browser upload path can use DOFS as a library:
    atomically publishes the reserved generation.
 6. Durably update application projections, then call
    `AcknowledgeDirectUpload`.
+7. Run `ReclaimDeleted` periodically (and after explicit permanent deletion)
+   to drain tombstones and superseded generations. Mounted backends also
+   reclaim locally when the last open handle closes.
 
 The payload never needs to traverse the application server. Metadata
 transactions and generation CAS safely arbitrate races with a writable FUSE
@@ -214,9 +222,17 @@ prefix. The object cleanup is retryable if interrupted.
 
 A prepared writeback WAL is replayed on the next writable mount. Uncommitted
 dirty state is discarded. A generation CAS loser cannot publish over a newer
-version. Superseded generations are retained while old readers may still be
-using them; inode deletion reclaims all generations. A separate retention/GC
-policy for long-lived overwritten files is not included yet.
+version. Superseded generations are retained for a default 4 hour 15 minute
+read-URL grace and then reclaimed; callers with a different maximum presigned
+GET lifetime can pass an explicit `ReclaimOptions` grace. Explicit permanent
+deletion invalidates outstanding reads, releases logical quota immediately,
+and queues every generation for physical deletion. `pending_reclaim_bytes` is
+the detached plaintext backlog, not exact provider-billed ciphertext bytes.
+
+The backing bucket should have versioning disabled. If provider versioning is
+enabled, a normal S3 delete may retain non-current versions and billing until a
+provider lifecycle rule removes them. Configure incomplete-multipart cleanup
+as well for applications using direct multipart uploads.
 
 ## Current deployment boundary
 

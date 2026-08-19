@@ -3,10 +3,92 @@
 package dofs_test
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/willvar/dofs"
 )
+
+func TestRealFUSEUnlinkDefersReclaimUntilLastHandleCloses(t *testing.T) {
+	if os.Getenv("DOFS_FUSE_INTEGRATION") != "1" {
+		t.Skip("set DOFS_FUSE_INTEGRATION=1 to exercise the kernel FUSE contract")
+	}
+	backend, metadata, objects := newBackend(t, true)
+	if err := backend.EnableWriteback(t.Context(), t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	mountpoint := t.TempDir()
+	mounted, err := dofsMountForTest(mountpoint, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = mounted.Unmount()
+		mounted.Wait()
+	}()
+
+	content := []byte("an unlinked open file must remain readable")
+	path := filepath.Join(mountpoint, "open-then-delete.txt")
+	if err := os.WriteFile(path, content, 0600); err != nil {
+		t.Fatal(err)
+	}
+	node, err := backend.Lookup(t.Context(), dofs.RootInode, filepath.Base(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		_ = reader.Close()
+		t.Fatal(err)
+	}
+	if _, exists := objects.Bytes(node.ObjectKey); !exists {
+		_ = reader.Close()
+		t.Fatal("ciphertext was reclaimed while an open handle still referenced it")
+	}
+	_, err = os.ReadFile(reader.Name())
+	if !errors.Is(err, os.ErrNotExist) {
+		_ = reader.Close()
+		t.Fatalf("unlinked path remains visible: %v", err)
+	}
+	buffer := make([]byte, len(content))
+	if _, err := reader.ReadAt(buffer, 0); err != nil {
+		_ = reader.Close()
+		t.Fatal(err)
+	}
+	if string(buffer) != string(content) {
+		_ = reader.Close()
+		t.Fatalf("open-handle content = %q", buffer)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, exists := objects.Bytes(node.ObjectKey); !exists {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("ciphertext remains after the last open handle closed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := metadata.GetNode(t.Context(), "tenant-a", node.Inode); !errors.Is(err, dofs.ErrNotFound) {
+		t.Fatalf("tombstone after last close = %v", err)
+	}
+	namespace, err := metadata.GetNamespace(t.Context(), "tenant-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if namespace.UsedBytes != 0 || namespace.PendingReclaimBytes != 0 {
+		t.Fatalf("usage after last close = used %d, pending %d", namespace.UsedBytes, namespace.PendingReclaimBytes)
+	}
+}
 
 func TestRealFUSECrossHandleWriteVisibility(t *testing.T) {
 	if os.Getenv("DOFS_FUSE_INTEGRATION") != "1" {

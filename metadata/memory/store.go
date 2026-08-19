@@ -20,6 +20,8 @@ type namespaceState struct {
 	events      []dofs.Event
 	nextInode   uint64
 	writerHeld  bool
+	mounts      int
+	reclaimHeld bool
 }
 
 // Store is a concurrency-safe implementation used by contract tests and
@@ -82,6 +84,7 @@ func (s *Store) CreateNamespace(ctx context.Context, namespace dofs.Namespace) (
 	}
 	now := s.now()
 	namespace.UsedBytes = 0
+	namespace.PendingReclaimBytes = 0
 	namespace.CreatedAt = now
 	namespace.UpdatedAt = now
 	root := dofs.Node{
@@ -141,6 +144,9 @@ func (s *Store) DeleteNamespace(ctx context.Context, id string) error {
 	}
 	if state.writerHeld {
 		return dofs.ErrWriterBusy
+	}
+	if state.mounts != 0 || state.reclaimHeld {
+		return dofs.ErrReclaimBusy
 	}
 	delete(s.namespaces, id)
 	return nil
@@ -307,8 +313,21 @@ func (s *Store) CommitGeneration(ctx context.Context, request dofs.CommitGenerat
 		return cloneNode(node), false, nil
 	}
 	delta := request.Size - node.Size
-	if state.namespace.QuotaBytes > 0 && delta > 0 && state.namespace.UsedBytes+delta > state.namespace.QuotaBytes {
+	if delta > 0 && (state.namespace.UsedBytes > math.MaxInt64-delta ||
+		(state.namespace.QuotaBytes > 0 && delta > state.namespace.QuotaBytes-state.namespace.UsedBytes)) {
 		return cloneNode(node), false, dofs.ErrQuotaExceeded
+	}
+	nextUsed, nextPending := state.namespace.UsedBytes, state.namespace.PendingReclaimBytes
+	if node.State == dofs.NodeStateDeleted {
+		if (delta < 0 && nextPending < -delta) || (delta > 0 && nextPending > math.MaxInt64-delta) {
+			return dofs.Node{}, false, errors.New("dofs: corrupt pending reclaim usage")
+		}
+		nextPending += delta
+	} else {
+		if delta < 0 && nextUsed < -delta {
+			return dofs.Node{}, false, errors.New("dofs: corrupt namespace usage")
+		}
+		nextUsed += delta
 	}
 	now := s.now()
 	node.Generation++
@@ -321,7 +340,8 @@ func (s *Store) CommitGeneration(ctx context.Context, request dofs.CommitGenerat
 		node.State = dofs.NodeStateReady
 	}
 	state.nodes[node.Inode] = node
-	state.namespace.UsedBytes += delta
+	state.namespace.UsedBytes = nextUsed
+	state.namespace.PendingReclaimBytes = nextPending
 	state.namespace.UpdatedAt = now
 	generation := dofs.Generation{
 		NamespaceID: node.NamespaceID, Inode: node.Inode, Number: node.Generation,
@@ -504,6 +524,10 @@ func (s *Store) RefreshExternalUpload(ctx context.Context, namespaceID, uploadID
 	}
 	now := s.now()
 	if upload.State != dofs.ExternalUploadActive || !upload.ExpiresAt.After(now) || !expiresAt.After(now) {
+		return cloneExternalUpload(upload), dofs.ErrConflict
+	}
+	node, exists := state.nodes[upload.Inode]
+	if !exists || (node.State != dofs.NodeStateCreating && node.State != dofs.NodeStateReady) {
 		return cloneExternalUpload(upload), dofs.ErrConflict
 	}
 	upload.ExpiresAt = expiresAt.UTC()
@@ -707,7 +731,9 @@ func (s *Store) Rename(ctx context.Context, request dofs.RenameRequest) (dofs.No
 		}
 		now := s.now()
 		oldDestinationParent, oldDestinationName := destination.Parent, destination.Name
-		tombstoneLocked(state, &destination, now)
+		if err := tombstoneLocked(state, &destination, now); err != nil {
+			return dofs.Node{}, nil, err
+		}
 		state.nodes[destination.Inode] = destination
 		s.appendEventLocked(state, dofs.Event{
 			NamespaceID: destination.NamespaceID, Kind: dofs.EventRemove, Inode: destination.Inode,
@@ -758,7 +784,9 @@ func (s *Store) Remove(ctx context.Context, request dofs.RemoveRequest) (dofs.No
 	}
 	now := s.now()
 	oldParent, oldName := node.Parent, node.Name
-	tombstoneLocked(state, &node, now)
+	if err := tombstoneLocked(state, &node, now); err != nil {
+		return dofs.Node{}, err
+	}
 	state.nodes[node.Inode] = node
 	s.appendEventLocked(state, dofs.Event{
 		NamespaceID: node.NamespaceID, Kind: dofs.EventRemove, Inode: node.Inode,
@@ -767,7 +795,7 @@ func (s *Store) Remove(ctx context.Context, request dofs.RemoveRequest) (dofs.No
 	return cloneNode(node), nil
 }
 
-func (s *Store) Purge(ctx context.Context, namespaceID string, inode uint64) (bool, error) {
+func (s *Store) Purge(ctx context.Context, namespaceID string, inode uint64, expectedGeneration int64) (bool, error) {
 	if err := contextError(ctx); err != nil {
 		return false, err
 	}
@@ -784,10 +812,21 @@ func (s *Store) Purge(ctx context.Context, namespaceID string, inode uint64) (bo
 	if node.State != dofs.NodeStateDeleted {
 		return false, dofs.ErrConflict
 	}
+	if node.Generation != expectedGeneration {
+		return false, dofs.ErrConflict
+	}
+	for _, upload := range state.uploads {
+		if upload.Inode == inode && upload.State == dofs.ExternalUploadActive && upload.ExpiresAt.After(s.now()) {
+			return false, dofs.ErrConflict
+		}
+	}
 	if node.IsDir() && len(state.children[inode]) != 0 {
 		return false, dofs.ErrDirectoryNotEmpty
 	}
-	state.namespace.UsedBytes -= node.Size
+	if state.namespace.PendingReclaimBytes < node.Size {
+		return false, errors.New("dofs: corrupt pending reclaim usage")
+	}
+	state.namespace.PendingReclaimBytes -= node.Size
 	state.namespace.UpdatedAt = s.now()
 	delete(state.generations, inode)
 	delete(state.children, inode)
@@ -812,6 +851,37 @@ func (s *Store) ListGenerations(ctx context.Context, namespaceID string, inode u
 	result := append([]dofs.Generation(nil), values...)
 	sort.Slice(result, func(first, second int) bool { return result[first].Number < result[second].Number })
 	return result, nil
+}
+
+func (s *Store) DeleteGeneration(ctx context.Context, namespaceID string, inode uint64, number int64) (bool, error) {
+	if err := contextError(ctx); err != nil {
+		return false, err
+	}
+	if number <= 0 {
+		return false, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, err := s.namespaceLocked(namespaceID)
+	if err != nil {
+		return false, err
+	}
+	node, exists := state.nodes[inode]
+	if !exists {
+		return false, dofs.ErrNotFound
+	}
+	if number >= node.Generation {
+		return false, dofs.ErrConflict
+	}
+	values := state.generations[inode]
+	for index, generation := range values {
+		if generation.Number != number {
+			continue
+		}
+		state.generations[inode] = append(values[:index], values[index+1:]...)
+		return true, nil
+	}
+	return false, nil
 }
 
 func (s *Store) ListState(ctx context.Context, namespaceID string, stateValue dofs.NodeState) ([]dofs.Node, error) {
@@ -913,7 +983,41 @@ func (s *Store) AcquireWriterLease(ctx context.Context, namespaceID string) (dof
 		return nil, dofs.ErrWriterBusy
 	}
 	state.writerHeld = true
-	return &lease{store: s, namespaceID: namespaceID}, nil
+	return &lease{store: s, namespaceID: namespaceID, kind: leaseWriter}, nil
+}
+
+func (s *Store) AcquireMountLease(ctx context.Context, namespaceID string) (dofs.Lease, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, err := s.namespaceLocked(namespaceID)
+	if err != nil {
+		return nil, err
+	}
+	if state.reclaimHeld || state.mounts != 0 {
+		return nil, dofs.ErrMountBusy
+	}
+	state.mounts = 1
+	return &lease{store: s, namespaceID: namespaceID, kind: leaseMount}, nil
+}
+
+func (s *Store) AcquireReclaimLease(ctx context.Context, namespaceID string) (dofs.Lease, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, err := s.namespaceLocked(namespaceID)
+	if err != nil {
+		return nil, err
+	}
+	if state.reclaimHeld || state.mounts != 0 {
+		return nil, dofs.ErrReclaimBusy
+	}
+	state.reclaimHeld = true
+	return &lease{store: s, namespaceID: namespaceID, kind: leaseReclaim}, nil
 }
 
 func (s *Store) namespaceLocked(id string) (*namespaceState, error) {
@@ -964,12 +1068,22 @@ func isDescendantLocked(state *namespaceState, candidate, ancestor uint64) bool 
 	return false
 }
 
-func tombstoneLocked(state *namespaceState, node *dofs.Node, now time.Time) {
+func tombstoneLocked(state *namespaceState, node *dofs.Node, now time.Time) error {
+	if state.namespace.UsedBytes < node.Size {
+		return errors.New("dofs: corrupt namespace usage")
+	}
+	if state.namespace.PendingReclaimBytes > math.MaxInt64-node.Size {
+		return errors.New("dofs: pending reclaim usage overflow")
+	}
 	delete(state.children[node.Parent], node.Name)
+	state.namespace.UsedBytes -= node.Size
+	state.namespace.PendingReclaimBytes += node.Size
+	state.namespace.UpdatedAt = now
 	node.Parent = 0
 	node.State = dofs.NodeStateDeleted
 	node.ChangedAt = now
 	node.DeletedAt = &now
+	return nil
 }
 
 func (s *Store) appendEventLocked(state *namespaceState, event dofs.Event) {
@@ -990,8 +1104,17 @@ func contextError(ctx context.Context) error {
 type lease struct {
 	store       *Store
 	namespaceID string
+	kind        leaseKind
 	once        sync.Once
 }
+
+type leaseKind uint8
+
+const (
+	leaseWriter leaseKind = iota
+	leaseMount
+	leaseReclaim
+)
 
 func (l *lease) Close() error {
 	if l == nil || l.store == nil {
@@ -1001,7 +1124,16 @@ func (l *lease) Close() error {
 		l.store.mu.Lock()
 		defer l.store.mu.Unlock()
 		if state := l.store.namespaces[l.namespaceID]; state != nil {
-			state.writerHeld = false
+			switch l.kind {
+			case leaseWriter:
+				state.writerHeld = false
+			case leaseMount:
+				if state.mounts > 0 {
+					state.mounts--
+				}
+			case leaseReclaim:
+				state.reclaimHeld = false
+			}
 		}
 	})
 	return nil

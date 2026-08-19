@@ -75,6 +75,10 @@ func TestSQLiteMetadataContractAndPersistence(t *testing.T) {
 	if err != nil || renamed.Name != "two.txt" || replaced == nil || replaced.Inode != second.Inode {
 		t.Fatalf("rename replace = %#v, %#v, %v", renamed, replaced, err)
 	}
+	afterReplace, err := store.GetNamespace(t.Context(), namespaceID)
+	if err != nil || afterReplace.UsedBytes != 7 || afterReplace.PendingReclaimBytes != 3 {
+		t.Fatalf("usage after replacement = %#v, %v", afterReplace, err)
+	}
 	events, err := store.ListEvents(t.Context(), namespaceID, 0, 100)
 	if err != nil {
 		t.Fatal(err)
@@ -88,14 +92,18 @@ func TestSQLiteMetadataContractAndPersistence(t *testing.T) {
 	if err != nil || removed.State != dofs.NodeStateDeleted {
 		t.Fatalf("remove = %#v, %v", removed, err)
 	}
+	afterRemove, err := store.GetNamespace(t.Context(), namespaceID)
+	if err != nil || afterRemove.UsedBytes != 0 || afterRemove.PendingReclaimBytes != 10 {
+		t.Fatalf("usage after removal = %#v, %v", afterRemove, err)
+	}
 	for _, inode := range []uint64{second.Inode, file.Inode} {
-		purged, err := store.Purge(t.Context(), namespaceID, inode)
+		purged, err := store.Purge(t.Context(), namespaceID, inode, 1)
 		if err != nil || !purged {
 			t.Fatalf("purge inode %d = %v, %v", inode, purged, err)
 		}
 	}
 	current, err := store.GetNamespace(t.Context(), namespaceID)
-	if err != nil || current.UsedBytes != 0 {
+	if err != nil || current.UsedBytes != 0 || current.PendingReclaimBytes != 0 {
 		t.Fatalf("namespace after purge = %#v, %v", current, err)
 	}
 	testExternalUploadReservation(t, store, namespaceID, directory.Inode)
@@ -113,6 +121,61 @@ func TestSQLiteMetadataContractAndPersistence(t *testing.T) {
 	}
 	if err := reopened.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSQLiteV3MigrationMovesDeletedUsageToPendingReclaim(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "metadata.sqlite"))
+	defer store.Close()
+	tx, err := store.begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(t.Context(), `CREATE TABLE dofs_schema (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        version INTEGER NOT NULL CHECK (version >= 0))`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(t.Context(), `INSERT INTO dofs_schema(singleton, version) VALUES (1, 0)`); err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range append(schemaV1Statements, schemaV2Statements...) {
+		if _, err := tx.ExecContext(t.Context(), statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := tx.ExecContext(t.Context(), `UPDATE dofs_schema SET version = 2 WHERE singleton = 1`); err != nil {
+		t.Fatal(err)
+	}
+	now := millis(time.Now().UTC())
+	if _, err := tx.ExecContext(t.Context(), `INSERT INTO dofs_namespaces(
+        id, wrapped_kek, used_bytes, created_at, updated_at
+    ) VALUES ('legacy', X'01', 7, ?, ?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(t.Context(), `INSERT INTO dofs_nodes(
+        namespace_id, inode, parent_inode, name, kind, state, mode, size,
+        generation, object_key, wrapped_dek, created_at, modified_at, changed_at, deleted_at
+    ) VALUES
+        ('legacy', 1, 0, '', 'directory', 'ready', 448, 0, 0, '', X'', ?, ?, ?, NULL),
+        ('legacy', 2, 0, 'gone.bin', 'file', 'deleted', 384, 7, 1,
+         '.dofs/v1/namespaces/legacy/objects/2/00000000000000000001-legacy.dofs', X'02', ?, ?, ?, ?)`,
+		now, now, now, now, now, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Migrate(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	namespace, err := store.GetNamespace(t.Context(), "legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if namespace.UsedBytes != 0 || namespace.PendingReclaimBytes != 7 {
+		t.Fatalf("migrated usage = %#v", namespace)
 	}
 }
 
@@ -155,7 +218,7 @@ func testExternalUploadReservation(t *testing.T, store *Store, namespaceID strin
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if purged, err := store.Purge(t.Context(), namespaceID, node.Inode); err != nil || !purged {
+	if purged, err := store.Purge(t.Context(), namespaceID, node.Inode, node.Generation); err != nil || !purged {
 		t.Fatalf("purge direct upload = %v, %v", purged, err)
 	}
 
@@ -274,6 +337,46 @@ func TestSQLiteWriterLeaseAcrossStoresAndLossDetection(t *testing.T) {
 		t.Fatalf("replace expired lease: %v", err)
 	}
 	if err := recovered.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSQLiteMountAndReclamationLeasesAcrossStores(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "metadata.sqlite")
+	first := openTestStore(t, path)
+	defer first.Close()
+	if err := first.Migrate(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.CreateNamespace(t.Context(), dofs.Namespace{ID: "tenant", WrappedKEK: []byte("wrapped")}); err != nil {
+		t.Fatal(err)
+	}
+	second := openTestStore(t, path)
+	defer second.Close()
+	if err := second.Migrate(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	firstMount, err := first.AcquireMountLease(t.Context(), "tenant")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.AcquireMountLease(t.Context(), "tenant"); !errors.Is(err, dofs.ErrMountBusy) {
+		t.Fatalf("second mount = %v", err)
+	}
+	if _, err := first.AcquireReclaimLease(t.Context(), "tenant"); !errors.Is(err, dofs.ErrReclaimBusy) {
+		t.Fatalf("reclaim with mount = %v", err)
+	}
+	if err := firstMount.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reclaimer, err := first.AcquireReclaimLease(t.Context(), "tenant")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.AcquireMountLease(t.Context(), "tenant"); !errors.Is(err, dofs.ErrMountBusy) {
+		t.Fatalf("mount during reclaim = %v", err)
+	}
+	if err := reclaimer.Close(); err != nil {
 		t.Fatal(err)
 	}
 }

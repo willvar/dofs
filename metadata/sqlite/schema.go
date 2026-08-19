@@ -1,6 +1,6 @@
 package sqlite
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 var schemaV1Statements = []string{
 	`CREATE TABLE IF NOT EXISTS dofs_namespaces (
@@ -103,4 +103,27 @@ var schemaV2Statements = []string{
         ON dofs_external_uploads(namespace_id, inode) WHERE state = 'active'`,
 	`CREATE INDEX IF NOT EXISTS dofs_external_uploads_state_expiry
         ON dofs_external_uploads(namespace_id, state, expires_at, upload_id)`,
+}
+
+var schemaV3Statements = []string{
+	`ALTER TABLE dofs_namespaces ADD COLUMN pending_reclaim_bytes INTEGER NOT NULL DEFAULT 0 CHECK (pending_reclaim_bytes >= 0)`,
+	`UPDATE dofs_namespaces
+        SET pending_reclaim_bytes = (
+                SELECT COALESCE(SUM(size), 0) FROM dofs_nodes
+                WHERE namespace_id = dofs_namespaces.id AND state = 'deleted'
+            ),
+            used_bytes = used_bytes - (
+                SELECT COALESCE(SUM(size), 0) FROM dofs_nodes
+                WHERE namespace_id = dofs_namespaces.id AND state = 'deleted'
+            )`,
+	`CREATE TABLE IF NOT EXISTS dofs_reclamation_leases (
+        namespace_id TEXT NOT NULL REFERENCES dofs_namespaces(id) ON DELETE CASCADE,
+        owner         TEXT NOT NULL,
+        mode          TEXT NOT NULL CHECK (mode IN ('mount', 'reclaim')),
+        acquired_at   INTEGER NOT NULL,
+        expires_at    INTEGER NOT NULL CHECK (expires_at > acquired_at),
+        PRIMARY KEY (namespace_id, owner)
+    )`,
+	`CREATE INDEX IF NOT EXISTS dofs_reclamation_leases_namespace_expiry
+        ON dofs_reclamation_leases(namespace_id, expires_at, mode)`,
 }

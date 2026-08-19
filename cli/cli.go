@@ -308,18 +308,20 @@ func runCheck(ctx context.Context, args []string, stdout, stderr io.Writer, opti
 }
 
 type namespaceView struct {
-	ID         string    `json:"id"`
-	Label      string    `json:"label"`
-	QuotaBytes int64     `json:"quota_bytes"`
-	UsedBytes  int64     `json:"used_bytes"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	ID                  string    `json:"id"`
+	Label               string    `json:"label"`
+	QuotaBytes          int64     `json:"quota_bytes"`
+	UsedBytes           int64     `json:"used_bytes"`
+	PendingReclaimBytes int64     `json:"pending_reclaim_bytes"`
+	CreatedAt           time.Time `json:"created_at"`
+	UpdatedAt           time.Time `json:"updated_at"`
 }
 
 func viewNamespace(namespace dofs.Namespace) namespaceView {
 	return namespaceView{
 		ID: namespace.ID, Label: namespace.Label, QuotaBytes: namespace.QuotaBytes,
-		UsedBytes: namespace.UsedBytes, CreatedAt: namespace.CreatedAt, UpdatedAt: namespace.UpdatedAt,
+		UsedBytes: namespace.UsedBytes, PendingReclaimBytes: namespace.PendingReclaimBytes,
+		CreatedAt: namespace.CreatedAt, UpdatedAt: namespace.UpdatedAt,
 	}
 }
 

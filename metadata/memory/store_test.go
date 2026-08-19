@@ -98,6 +98,10 @@ func TestRenameReplaceRemoveAndPurge(t *testing.T) {
 	if err != nil || renamed.Name != "second" || replaced == nil || replaced.Inode != second.Inode || replaced.State != dofs.NodeStateDeleted {
 		t.Fatalf("rename = %#v, %#v, %v", renamed, replaced, err)
 	}
+	afterReplace, err := store.GetNamespace(t.Context(), namespace.ID)
+	if err != nil || afterReplace.UsedBytes != 4 || afterReplace.PendingReclaimBytes != 5 {
+		t.Fatalf("usage after replacement = %#v, %v", afterReplace, err)
+	}
 	events, err := store.ListEvents(t.Context(), namespace.ID, 0, 100)
 	if err != nil || len(events) != 4 || events[2].Kind != dofs.EventRemove || events[2].Inode != second.Inode || events[3].Kind != dofs.EventRename {
 		t.Fatalf("rename events = %#v, %v", events, err)
@@ -108,15 +112,19 @@ func TestRenameReplaceRemoveAndPurge(t *testing.T) {
 	if err != nil || removed.State != dofs.NodeStateDeleted {
 		t.Fatalf("remove = %#v, %v", removed, err)
 	}
+	afterRemove, err := store.GetNamespace(t.Context(), namespace.ID)
+	if err != nil || afterRemove.UsedBytes != 0 || afterRemove.PendingReclaimBytes != 9 {
+		t.Fatalf("usage after removal = %#v, %v", afterRemove, err)
+	}
 	for _, inode := range []uint64{second.Inode, first.Inode} {
-		purged, err := store.Purge(t.Context(), namespace.ID, inode)
+		purged, err := store.Purge(t.Context(), namespace.ID, inode, 1)
 		if err != nil || !purged {
 			t.Fatalf("purge %d = %v, %v", inode, purged, err)
 		}
 	}
 	currentNamespace, _ := store.GetNamespace(t.Context(), namespace.ID)
-	if currentNamespace.UsedBytes != 0 {
-		t.Fatalf("used bytes = %d", currentNamespace.UsedBytes)
+	if currentNamespace.UsedBytes != 0 || currentNamespace.PendingReclaimBytes != 0 {
+		t.Fatalf("namespace usage = %#v", currentNamespace)
 	}
 }
 

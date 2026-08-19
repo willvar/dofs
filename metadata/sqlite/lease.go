@@ -18,11 +18,10 @@ func (s *Store) AcquireWriterLease(ctx context.Context, namespaceID string) (dof
 	if _, err := s.GetNamespace(ctx, namespaceID); err != nil {
 		return nil, err
 	}
-	ownerBytes := make([]byte, 16)
-	if _, err := rand.Read(ownerBytes); err != nil {
-		return nil, fmt.Errorf("generate DOFS SQLite lease owner: %w", err)
+	owner, err := newLeaseOwner()
+	if err != nil {
+		return nil, err
 	}
-	owner := hex.EncodeToString(ownerBytes)
 	now := s.now().UTC()
 	expiresAt := now.Add(s.leaseTTL)
 	tx, err := s.begin(ctx)
@@ -59,6 +58,14 @@ func (s *Store) AcquireWriterLease(ctx context.Context, namespaceID string) (dof
 	}
 	go lease.monitor()
 	return lease, nil
+}
+
+func newLeaseOwner() (string, error) {
+	ownerBytes := make([]byte, 16)
+	if _, err := rand.Read(ownerBytes); err != nil {
+		return "", fmt.Errorf("generate DOFS SQLite lease owner: %w", err)
+	}
+	return hex.EncodeToString(ownerBytes), nil
 }
 
 type writerLease struct {

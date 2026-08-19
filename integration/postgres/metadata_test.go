@@ -73,6 +73,10 @@ func TestMetadataContract(t *testing.T) {
 	if err != nil || renamed.Name != "two.txt" || replaced == nil || replaced.Inode != second.Inode {
 		t.Fatalf("rename replace = %#v, %#v, %v", renamed, replaced, err)
 	}
+	afterReplace, err := store.GetNamespace(t.Context(), namespaceID)
+	if err != nil || afterReplace.UsedBytes != 7 || afterReplace.PendingReclaimBytes != 3 {
+		t.Fatalf("usage after replacement = %#v, %v", afterReplace, err)
+	}
 	events, err := store.ListEvents(t.Context(), namespaceID, 0, 100)
 	if err != nil || len(events) != 5 || events[3].Kind != dofs.EventRemove || events[4].Kind != dofs.EventRename {
 		t.Fatalf("events = %#v, %v", events, err)
@@ -83,16 +87,21 @@ func TestMetadataContract(t *testing.T) {
 	if err != nil || removed.State != dofs.NodeStateDeleted {
 		t.Fatalf("remove = %#v, %v", removed, err)
 	}
+	afterRemove, err := store.GetNamespace(t.Context(), namespaceID)
+	if err != nil || afterRemove.UsedBytes != 0 || afterRemove.PendingReclaimBytes != 10 {
+		t.Fatalf("usage after removal = %#v, %v", afterRemove, err)
+	}
 	for _, inode := range []uint64{second.Inode, first.Inode} {
-		if purged, err := store.Purge(t.Context(), namespaceID, inode); err != nil || !purged {
+		if purged, err := store.Purge(t.Context(), namespaceID, inode, 1); err != nil || !purged {
 			t.Fatalf("purge %d = %v, %v", inode, purged, err)
 		}
 	}
-	if namespace, err := store.GetNamespace(t.Context(), namespaceID); err != nil || namespace.UsedBytes != 0 {
+	if namespace, err := store.GetNamespace(t.Context(), namespaceID); err != nil || namespace.UsedBytes != 0 || namespace.PendingReclaimBytes != 0 {
 		t.Fatalf("namespace after purge = %#v, %v", namespace, err)
 	}
 	testExternalUpload(t, store, namespaceID, directory.Inode)
 	testWriterLease(t, store, namespaceID)
+	testReclamationLeases(t, store, namespaceID)
 	testConcurrentCreate(t, store, namespaceID, directory.Inode)
 }
 
@@ -164,7 +173,7 @@ func testExternalUpload(t *testing.T, store *dofspostgres.Store, namespaceID str
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if purged, err := store.Purge(t.Context(), namespaceID, node.Inode); err != nil || !purged {
+	if purged, err := store.Purge(t.Context(), namespaceID, node.Inode, node.Generation); err != nil || !purged {
 		t.Fatalf("purge direct upload = %v, %v", purged, err)
 	}
 
@@ -230,6 +239,33 @@ func testWriterLease(t *testing.T, store *dofspostgres.Store, namespaceID string
 		t.Fatalf("lease after release: %v", err)
 	}
 	if err := lease.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func testReclamationLeases(t *testing.T, store *dofspostgres.Store, namespaceID string) {
+	t.Helper()
+	first, err := store.AcquireMountLease(t.Context(), namespaceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcquireMountLease(t.Context(), namespaceID); !errors.Is(err, dofs.ErrMountBusy) {
+		t.Fatalf("second mount = %v", err)
+	}
+	if _, err := store.AcquireReclaimLease(t.Context(), namespaceID); !errors.Is(err, dofs.ErrReclaimBusy) {
+		t.Fatalf("reclaim with mount = %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reclaimer, err := store.AcquireReclaimLease(t.Context(), namespaceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcquireMountLease(t.Context(), namespaceID); !errors.Is(err, dofs.ErrMountBusy) {
+		t.Fatalf("mount during reclaim = %v", err)
+	}
+	if err := reclaimer.Close(); err != nil {
 		t.Fatal(err)
 	}
 }

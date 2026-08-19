@@ -1,6 +1,6 @@
 package postgres
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 const createSchema = `
 CREATE TABLE IF NOT EXISTS dofs_namespaces (
@@ -99,4 +99,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS dofs_external_uploads_active_inode
     ON dofs_external_uploads(namespace_id, inode) WHERE state = 'active';
 CREATE INDEX IF NOT EXISTS dofs_external_uploads_state_expiry
     ON dofs_external_uploads(namespace_id, state, expires_at, upload_id);
+`
+
+const createReclamationSchema = `
+ALTER TABLE dofs_namespaces
+    ADD COLUMN pending_reclaim_bytes BIGINT NOT NULL DEFAULT 0 CHECK (pending_reclaim_bytes >= 0);
+UPDATE dofs_namespaces AS namespace
+SET pending_reclaim_bytes = deleted.bytes,
+    used_bytes = namespace.used_bytes - deleted.bytes
+FROM (
+    SELECT namespace_id, COALESCE(SUM(size), 0) AS bytes
+    FROM dofs_nodes
+    WHERE state = 'deleted'
+    GROUP BY namespace_id
+) AS deleted
+WHERE namespace.id = deleted.namespace_id;
 `

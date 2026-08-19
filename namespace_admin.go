@@ -17,6 +17,18 @@ func DeleteNamespace(ctx context.Context, metadata MetadataStore, objects Object
 	if err := ValidateNamespaceID(namespaceID); err != nil {
 		return err
 	}
+	if _, err := metadata.GetNamespace(ctx, namespaceID); errors.Is(err, ErrNotFound) {
+		prefix, prefixErr := ObjectRoot(namespaceID)
+		if prefixErr != nil {
+			return prefixErr
+		}
+		if deleteErr := objects.DeletePrefix(ctx, prefix); deleteErr != nil && !errors.Is(deleteErr, ErrObjectNotFound) {
+			return fmt.Errorf("delete DOFS namespace objects: %w", deleteErr)
+		}
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("inspect DOFS namespace: %w", err)
+	}
 	if err := metadata.DeleteNamespace(ctx, namespaceID); err != nil && !errors.Is(err, ErrNotFound) {
 		return fmt.Errorf("delete DOFS namespace metadata: %w", err)
 	}

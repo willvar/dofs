@@ -12,6 +12,8 @@ import (
 	"time"
 )
 
+const DefaultMountedReclaimInterval = 30 * time.Second
+
 type BackendOptions struct {
 	// Writable acquires the namespace writer lease. It enables namespace
 	// mutations; regular-file write handles additionally require a writeback
@@ -22,6 +24,14 @@ type BackendOptions struct {
 	// direct-to-object-storage uploads that may safely race with one mounted
 	// writer through metadata transactions and generation CAS.
 	ControlPlane bool
+	// Mounted registers this backend as a live FUSE consumer. All mounted
+	// backends, including read-only mounts, exclude physical reclamation while
+	// Unix file handles may still reference immutable generations.
+	Mounted bool
+	// MountedReclaimInterval controls how often a mounted backend drains work
+	// that external reclaimers must defer to its local open-handle registry.
+	// Zero selects DefaultMountedReclaimInterval.
+	MountedReclaimInterval time.Duration
 }
 
 type cachedFileKey struct {
@@ -34,15 +44,20 @@ type cachedFileKey struct {
 // Backend exposes one namespace as plaintext inode operations. It is strictly
 // namespace-scoped: callers cannot pass a second namespace to any method.
 type Backend struct {
-	namespace   Namespace
-	metadata    MetadataStore
-	objects     ObjectStore
-	keys        KeyProvider
-	kek         []byte
-	lease       Lease
-	writeback   *WritebackManager
-	writebackMu sync.Mutex
-	mutations   bool
+	namespace    Namespace
+	metadata     MetadataStore
+	objects      ObjectStore
+	keys         KeyProvider
+	kek          []byte
+	lease        Lease
+	mountLease   Lease
+	mountMu      sync.Mutex
+	reclaimStop  context.CancelFunc
+	reclaimDone  chan struct{}
+	reclaimEvery time.Duration
+	writeback    *WritebackManager
+	writebackMu  sync.Mutex
+	mutations    bool
 
 	keyMu    sync.Mutex
 	fileKeys map[uint64]*cachedFileKey
@@ -50,6 +65,13 @@ type Backend struct {
 	handleMu sync.Mutex
 	open     map[uint64]int
 	closed   bool
+
+	leaseStateMu  sync.Mutex
+	leaseLost     chan struct{}
+	leaseStop     chan struct{}
+	leaseLostOnce sync.Once
+	leaseStopOnce sync.Once
+	leaseErr      error
 }
 
 func NewBackend(
@@ -65,6 +87,13 @@ func NewBackend(
 	}
 	if metadata == nil || objects == nil || keys == nil {
 		return nil, errors.New("dofs: metadata, object store and key provider are required")
+	}
+	if options.MountedReclaimInterval < 0 {
+		return nil, errors.New("dofs: mounted reclaim interval cannot be negative")
+	}
+	reclaimInterval := options.MountedReclaimInterval
+	if reclaimInterval == 0 {
+		reclaimInterval = DefaultMountedReclaimInterval
 	}
 	namespace, err := metadata.GetNamespace(ctx, namespaceID)
 	if err != nil {
@@ -88,7 +117,13 @@ func NewBackend(
 	backend := &Backend{
 		namespace: namespace, metadata: metadata, objects: objects, keys: keys, kek: kek,
 		fileKeys: make(map[uint64]*cachedFileKey), open: make(map[uint64]int),
-		mutations: options.Writable || options.ControlPlane,
+		mutations: options.Writable || options.ControlPlane, reclaimEvery: reclaimInterval,
+	}
+	if options.Mounted || options.Writable {
+		if err := backend.protectMount(ctx); err != nil {
+			backend.Close()
+			return nil, err
+		}
 	}
 	if options.Writable {
 		lease, err := metadata.AcquireWriterLease(ctx, namespaceID)
@@ -97,8 +132,53 @@ func NewBackend(
 			return nil, fmt.Errorf("acquire DOFS writer lease: %w", err)
 		}
 		backend.lease = lease
+		backend.watchLease("writer", lease)
 	}
 	return backend, nil
+}
+
+func (b *Backend) protectMount(ctx context.Context) error {
+	if b == nil {
+		return errors.New("dofs: backend is required")
+	}
+	b.mountMu.Lock()
+	defer b.mountMu.Unlock()
+	if b.mountLease != nil {
+		return nil
+	}
+	mountLease, err := b.metadata.AcquireMountLease(ctx, b.namespace.ID)
+	if err != nil {
+		return fmt.Errorf("acquire DOFS mount lease: %w", err)
+	}
+	b.mountLease = mountLease
+	b.watchLease("mount", mountLease)
+	b.startMountedReclaimerLocked()
+	return nil
+}
+
+func (b *Backend) startMountedReclaimerLocked() {
+	if b.reclaimStop != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	b.reclaimStop = cancel
+	b.reclaimDone = done
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(b.reclaimEvery)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				passCtx, passCancel := context.WithTimeout(ctx, 30*time.Second)
+				_ = b.reclaimMounted(passCtx)
+				passCancel()
+			}
+		}
+	}()
 }
 
 func (b *Backend) Namespace() Namespace { return b.namespace }
@@ -106,22 +186,75 @@ func (b *Backend) Writable() bool       { return b != nil && b.lease != nil }
 func (b *Backend) CanMutate() bool      { return b != nil && b.mutations }
 
 func (b *Backend) LeaseLost() <-chan struct{} {
-	if b == nil || b.lease == nil {
+	if b == nil {
 		return nil
 	}
-	return b.lease.Lost()
+	b.leaseStateMu.Lock()
+	defer b.leaseStateMu.Unlock()
+	return b.leaseLost
 }
 
 func (b *Backend) LeaseError() error {
-	if b == nil || b.lease == nil {
+	if b == nil {
 		return nil
 	}
-	return b.lease.Err()
+	b.leaseStateMu.Lock()
+	err := b.leaseErr
+	b.leaseStateMu.Unlock()
+	if err != nil {
+		return err
+	}
+	if b.lease != nil && b.lease.Err() != nil {
+		return b.lease.Err()
+	}
+	if b.mountLease != nil {
+		return b.mountLease.Err()
+	}
+	return nil
+}
+
+func (b *Backend) watchLease(label string, lease Lease) {
+	if lease == nil || lease.Lost() == nil {
+		return
+	}
+	b.leaseStateMu.Lock()
+	if b.leaseLost == nil {
+		b.leaseLost = make(chan struct{})
+		b.leaseStop = make(chan struct{})
+	}
+	lost := b.leaseLost
+	stop := b.leaseStop
+	b.leaseStateMu.Unlock()
+	go func() {
+		select {
+		case <-lease.Lost():
+			err := lease.Err()
+			if err == nil {
+				err = ErrLeaseLost
+			}
+			b.leaseStateMu.Lock()
+			if b.leaseErr == nil {
+				b.leaseErr = fmt.Errorf("DOFS %s lease lost: %w", label, err)
+			}
+			b.leaseStateMu.Unlock()
+			b.leaseLostOnce.Do(func() { close(lost) })
+		case <-stop:
+		}
+	}()
 }
 
 func (b *Backend) Close() error {
 	if b == nil {
 		return nil
+	}
+	b.mountMu.Lock()
+	reclaimStop := b.reclaimStop
+	reclaimDone := b.reclaimDone
+	b.mountMu.Unlock()
+	if reclaimStop != nil {
+		// Cancel object-store I/O before waiting for the handle mutex: a mounted
+		// reclamation pass may currently hold it while deleting an object.
+		reclaimStop()
 	}
 	b.handleMu.Lock()
 	if b.closed {
@@ -130,6 +263,18 @@ func (b *Backend) Close() error {
 	}
 	b.closed = true
 	b.handleMu.Unlock()
+	if reclaimDone != nil {
+		<-reclaimDone
+	}
+	b.mountMu.Lock()
+	b.reclaimStop = nil
+	b.reclaimDone = nil
+	b.mountMu.Unlock()
+	b.leaseStateMu.Lock()
+	if b.leaseStop != nil {
+		b.leaseStopOnce.Do(func() { close(b.leaseStop) })
+	}
+	b.leaseStateMu.Unlock()
 	b.writebackMu.Lock()
 	manager := b.writeback
 	b.writeback = nil
@@ -146,10 +291,14 @@ func (b *Backend) Close() error {
 		delete(b.fileKeys, inode)
 	}
 	b.keyMu.Unlock()
+	var closeErrors []error
 	if b.lease != nil {
-		return b.lease.Close()
+		closeErrors = append(closeErrors, b.lease.Close())
 	}
-	return nil
+	if b.mountLease != nil {
+		closeErrors = append(closeErrors, b.mountLease.Close())
+	}
+	return errors.Join(closeErrors...)
 }
 
 // EnableWriteback attaches private local cache/WAL state and replays durable
@@ -235,18 +384,7 @@ func (b *Backend) recoverNamespace(ctx context.Context) error {
 			return err
 		}
 	}
-	deleted, err := b.metadata.ListState(ctx, b.namespace.ID, NodeStateDeleted)
-	if err != nil {
-		return err
-	}
-	for _, node := range deleted {
-		if b.openCount(node.Inode) == 0 {
-			if err := b.purgeDeleted(ctx, node); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return b.reclaimMounted(ctx)
 }
 
 func (b *Backend) GetNode(ctx context.Context, inode uint64) (Node, error) {
@@ -519,6 +657,11 @@ func (b *Backend) Rename(ctx context.Context, inode, newParent uint64, newName s
 	if err := b.requireMutation(); err != nil {
 		return Node{}, err
 	}
+	b.handleMu.Lock()
+	defer b.handleMu.Unlock()
+	if b.closed {
+		return Node{}, errors.New("dofs: backend is closed")
+	}
 	renamed, replaced, err := b.metadata.Rename(ctx, RenameRequest{
 		NamespaceID: b.namespace.ID, Inode: inode, NewParent: newParent,
 		NewName: newName, NoReplace: noReplace,
@@ -529,7 +672,7 @@ func (b *Backend) Rename(ctx context.Context, inode, newParent uint64, newName s
 	// Only the backend holding the writeback lease can prove that no FUSE
 	// handle still references a replaced inode. Control-plane mutations leave
 	// tombstones for that writer (or mount recovery) to collect safely.
-	if replaced != nil && b.Writable() && b.openCount(replaced.Inode) == 0 {
+	if replaced != nil && b.Writable() && b.open[replaced.Inode] == 0 {
 		_ = b.purgeDeleted(context.Background(), *replaced)
 	}
 	return renamed, nil
@@ -539,23 +682,35 @@ func (b *Backend) Remove(ctx context.Context, parent uint64, name string, direct
 	if err := b.requireMutation(); err != nil {
 		return err
 	}
+	b.handleMu.Lock()
+	defer b.handleMu.Unlock()
+	if b.closed {
+		return errors.New("dofs: backend is closed")
+	}
 	removed, err := b.metadata.Remove(ctx, RemoveRequest{
 		NamespaceID: b.namespace.ID, Parent: parent, Name: name, Directory: directory,
 	})
 	if err != nil {
 		return err
 	}
-	if b.Writable() && b.openCount(removed.Inode) == 0 {
+	if b.Writable() && b.open[removed.Inode] == 0 {
 		_ = b.purgeDeleted(context.Background(), removed)
 	}
 	return nil
 }
 
-func (b *Backend) retain(inode uint64) error {
+func (b *Backend) retain(ctx context.Context, inode uint64) error {
 	b.handleMu.Lock()
 	defer b.handleMu.Unlock()
 	if b.closed {
 		return errors.New("dofs: backend is closed")
+	}
+	node, err := b.metadata.GetNode(ctx, b.namespace.ID, inode)
+	if err != nil {
+		return err
+	}
+	if node.State != NodeStateReady && !(node.State == NodeStateDeleted && b.open[inode] > 0) {
+		return ErrNotFound
 	}
 	b.open[inode]++
 	return nil
@@ -569,10 +724,13 @@ func (b *Backend) release(ctx context.Context, inode uint64) error {
 		return nil
 	}
 	delete(b.open, inode)
-	b.handleMu.Unlock()
+	defer b.handleMu.Unlock()
 	node, err := b.metadata.GetNode(ctx, b.namespace.ID, inode)
 	if err == nil && node.State == NodeStateDeleted {
 		return b.purgeDeleted(ctx, node)
+	}
+	if err == nil && node.State == NodeStateReady && node.IsFile() {
+		return b.pruneSuperseded(ctx, node)
 	}
 	if errors.Is(err, ErrNotFound) {
 		return nil
@@ -580,10 +738,59 @@ func (b *Backend) release(ctx context.Context, inode uint64) error {
 	return err
 }
 
-func (b *Backend) openCount(inode uint64) int {
+// reclaimMounted performs the reclamation work that the namespace's external
+// collector must defer while this backend holds the exclusive mount lease.
+// Each inode is checked against the local handle registry under the same lock
+// used by Open, Unlink and replacement Rename.
+func (b *Backend) reclaimMounted(ctx context.Context) error {
+	if b.mountLease == nil {
+		return nil
+	}
+	if err := requireLiveLease(b.mountLease); err != nil {
+		return err
+	}
+	deleted, err := b.metadata.ListState(ctx, b.namespace.ID, NodeStateDeleted)
+	if err != nil {
+		return err
+	}
+	ready, readyErr := b.metadata.ListState(ctx, b.namespace.ID, NodeStateReady)
+	if readyErr != nil {
+		return readyErr
+	}
+	var reclaimErrors []error
+	for _, node := range deleted {
+		if err := b.reclaimNodeIfClosed(ctx, node); err != nil {
+			reclaimErrors = append(reclaimErrors, fmt.Errorf("reclaim inode %d: %w", node.Inode, err))
+		}
+	}
+	for _, node := range ready {
+		if !node.IsFile() || node.Generation <= 1 {
+			continue
+		}
+		if err := b.reclaimNodeIfClosed(ctx, node); err != nil {
+			reclaimErrors = append(reclaimErrors, fmt.Errorf("prune inode %d generations: %w", node.Inode, err))
+		}
+	}
+	return errors.Join(reclaimErrors...)
+}
+
+func (b *Backend) reclaimNodeIfClosed(ctx context.Context, node Node) error {
 	b.handleMu.Lock()
 	defer b.handleMu.Unlock()
-	return b.open[inode]
+	if b.closed || b.open[node.Inode] != 0 {
+		return nil
+	}
+	if err := requireLiveLease(b.mountLease); err != nil {
+		return err
+	}
+	switch node.State {
+	case NodeStateDeleted:
+		return b.purgeDeleted(ctx, node)
+	case NodeStateReady:
+		return b.pruneSuperseded(ctx, node)
+	default:
+		return nil
+	}
 }
 
 func (b *Backend) purgeDeleted(ctx context.Context, node Node) error {
@@ -594,13 +801,69 @@ func (b *Backend) purgeDeleted(ctx context.Context, node Node) error {
 	if err != nil {
 		return err
 	}
+	activeUploads, err := b.metadata.ListExternalUploads(ctx, b.namespace.ID, ExternalUploadActive)
+	if err != nil {
+		return err
+	}
+	committedUploads, err := b.metadata.ListExternalUploads(ctx, b.namespace.ID, ExternalUploadCommitted)
+	if err != nil {
+		return err
+	}
+	keys := make(map[string]struct{}, len(generations))
 	for _, generation := range generations {
-		if err := b.objects.Delete(ctx, generation.ObjectKey); err != nil && !errors.Is(err, ErrObjectNotFound) {
+		keys[generation.ObjectKey] = struct{}{}
+	}
+	for _, upload := range append(activeUploads, committedUploads...) {
+		if upload.Inode != node.Inode {
+			continue
+		}
+		if upload.State == ExternalUploadActive && time.Now().UTC().Before(upload.ExpiresAt) {
+			return nil
+		}
+		keys[upload.ObjectKey] = struct{}{}
+	}
+	for key := range keys {
+		if err := b.objects.Delete(ctx, key); err != nil && !errors.Is(err, ErrObjectNotFound) {
 			return err
 		}
 	}
-	_, err = b.metadata.Purge(ctx, b.namespace.ID, node.Inode)
+	_, err = b.metadata.Purge(ctx, b.namespace.ID, node.Inode, node.Generation)
 	return err
+}
+
+func (b *Backend) pruneSuperseded(ctx context.Context, node Node) error {
+	if node.State != NodeStateReady || !node.IsFile() || node.Generation <= 1 {
+		return nil
+	}
+	generations, err := b.metadata.ListGenerations(ctx, b.namespace.ID, node.Inode)
+	if err != nil {
+		return err
+	}
+	var currentCreatedAt time.Time
+	for _, generation := range generations {
+		if generation.Number == node.Generation {
+			currentCreatedAt = generation.CreatedAt
+			break
+		}
+	}
+	if currentCreatedAt.IsZero() {
+		return fmt.Errorf("dofs: inode %d current generation %d is missing", node.Inode, node.Generation)
+	}
+	if time.Now().UTC().Before(currentCreatedAt.Add(DefaultSupersededGenerationGrace)) {
+		return nil
+	}
+	for _, generation := range generations {
+		if generation.Number >= node.Generation {
+			continue
+		}
+		if err := b.objects.Delete(ctx, generation.ObjectKey); err != nil && !errors.Is(err, ErrObjectNotFound) {
+			return err
+		}
+		if _, err := b.metadata.DeleteGeneration(ctx, b.namespace.ID, node.Inode, generation.Number); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func randomTransactionID() (string, error) {

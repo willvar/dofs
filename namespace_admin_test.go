@@ -25,6 +25,16 @@ func TestDeleteNamespaceIsScopedAndRetryable(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	mount, err := metadata.AcquireMountLease(t.Context(), "delete-me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dofs.DeleteNamespace(t.Context(), metadata, objects, "delete-me"); !errors.Is(err, dofs.ErrReclaimBusy) {
+		t.Fatalf("delete mounted namespace = %v", err)
+	}
+	if err := mount.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if err := dofs.DeleteNamespace(t.Context(), metadata, objects, "delete-me"); err != nil {
 		t.Fatal(err)
 	}

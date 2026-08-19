@@ -2,9 +2,11 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/willvar/dofs"
 )
@@ -38,8 +40,8 @@ func (s *Store) CommitGeneration(ctx context.Context, request dofs.CommitGenerat
 	if node.Generation != request.ExpectedGeneration {
 		return node, false, nil
 	}
-	var quota, used int64
-	if err := tx.QueryRowContext(ctx, `SELECT quota_bytes, used_bytes FROM dofs_namespaces WHERE id = ?`, request.NamespaceID).Scan(&quota, &used); err != nil {
+	var quota, used, pending int64
+	if err := tx.QueryRowContext(ctx, `SELECT quota_bytes, used_bytes, pending_reclaim_bytes FROM dofs_namespaces WHERE id = ?`, request.NamespaceID).Scan(&quota, &used, &pending); err != nil {
 		return dofs.Node{}, false, mapError(err)
 	}
 	delta := request.Size - node.Size
@@ -75,8 +77,21 @@ func (s *Store) CommitGeneration(ctx context.Context, request dofs.CommitGenerat
 	); err != nil {
 		return dofs.Node{}, false, fmt.Errorf("advance DOFS SQLite generation: %w", err)
 	}
+	nextUsed, nextPending := used, pending
+	if node.State == dofs.NodeStateDeleted {
+		if (delta < 0 && pending < -delta) || (delta > 0 && pending > math.MaxInt64-delta) {
+			return dofs.Node{}, false, errors.New("dofs sqlite: corrupt pending reclaim usage")
+		}
+		nextPending = pending + delta
+	} else {
+		if delta < 0 && used < -delta {
+			return dofs.Node{}, false, errors.New("dofs sqlite: corrupt namespace usage")
+		}
+		nextUsed = used + delta
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE dofs_namespaces
-        SET used_bytes = ?, updated_at = ? WHERE id = ?`, used+delta, millis(now), request.NamespaceID); err != nil {
+        SET used_bytes = ?, pending_reclaim_bytes = ?, updated_at = ? WHERE id = ?`,
+		nextUsed, nextPending, millis(now), request.NamespaceID); err != nil {
 		return dofs.Node{}, false, fmt.Errorf("update DOFS SQLite namespace usage: %w", err)
 	}
 	kind := dofs.EventWrite
@@ -195,6 +210,9 @@ func (s *Store) Rename(ctx context.Context, request dofs.RenameRequest) (dofs.No
 		destination.State = dofs.NodeStateDeleted
 		destination.ChangedAt = now
 		destination.DeletedAt = &now
+		if err := moveUsageToPending(ctx, tx, request.NamespaceID, destination.Size, now); err != nil {
+			return dofs.Node{}, nil, err
+		}
 		replaced = &destination
 	} else if !errors.Is(destinationErr, dofs.ErrNotFound) {
 		return dofs.Node{}, nil, destinationErr
@@ -280,6 +298,9 @@ func (s *Store) Remove(ctx context.Context, request dofs.RemoveRequest) (dofs.No
 	node.State = dofs.NodeStateDeleted
 	node.ChangedAt = now
 	node.DeletedAt = &now
+	if err := moveUsageToPending(ctx, tx, request.NamespaceID, node.Size, now); err != nil {
+		return dofs.Node{}, err
+	}
 	if err := insertEvent(ctx, tx, dofs.Event{
 		NamespaceID: node.NamespaceID, Kind: dofs.EventRemove, Inode: node.Inode,
 		Generation: node.Generation, OldParent: oldParent, OldName: oldName, CreatedAt: now,
@@ -292,11 +313,11 @@ func (s *Store) Remove(ctx context.Context, request dofs.RemoveRequest) (dofs.No
 	return node, nil
 }
 
-func (s *Store) Purge(ctx context.Context, namespaceID string, inode uint64) (bool, error) {
+func (s *Store) Purge(ctx context.Context, namespaceID string, inode uint64, expectedGeneration int64) (bool, error) {
 	if err := dofs.ValidateNamespaceID(namespaceID); err != nil {
 		return false, err
 	}
-	if inode == 0 || inode > math.MaxInt64 {
+	if inode == 0 || inode > math.MaxInt64 || expectedGeneration < 0 {
 		return false, nil
 	}
 	tx, err := s.begin(ctx)
@@ -318,6 +339,18 @@ func (s *Store) Purge(ctx context.Context, namespaceID string, inode uint64) (bo
 	if node.State != dofs.NodeStateDeleted {
 		return false, dofs.ErrConflict
 	}
+	if node.Generation != expectedGeneration {
+		return false, dofs.ErrConflict
+	}
+	var liveUpload bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM dofs_external_uploads
+        WHERE namespace_id = ? AND inode = ? AND state = 'active' AND expires_at > ?)`,
+		namespaceID, inode, millis(s.now().UTC())).Scan(&liveUpload); err != nil {
+		return false, err
+	}
+	if liveUpload {
+		return false, dofs.ErrConflict
+	}
 	if node.IsDir() {
 		var nonempty bool
 		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
@@ -328,24 +361,41 @@ func (s *Store) Purge(ctx context.Context, namespaceID string, inode uint64) (bo
 			return false, dofs.ErrDirectoryNotEmpty
 		}
 	}
-	var used int64
-	if err := tx.QueryRowContext(ctx, `SELECT used_bytes FROM dofs_namespaces WHERE id = ?`, namespaceID).Scan(&used); err != nil {
+	var pending int64
+	if err := tx.QueryRowContext(ctx, `SELECT pending_reclaim_bytes FROM dofs_namespaces WHERE id = ?`, namespaceID).Scan(&pending); err != nil {
 		return false, mapError(err)
 	}
-	if used < node.Size {
-		return false, errors.New("dofs sqlite: corrupt namespace usage")
+	if pending < node.Size {
+		return false, errors.New("dofs sqlite: corrupt pending reclaim usage")
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM dofs_nodes WHERE namespace_id = ? AND inode = ?`, namespaceID, inode); err != nil {
 		return false, fmt.Errorf("purge DOFS SQLite inode: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE dofs_namespaces
-        SET used_bytes = ?, updated_at = ? WHERE id = ?`, used-node.Size, millis(s.now()), namespaceID); err != nil {
-		return false, fmt.Errorf("release DOFS SQLite namespace usage: %w", err)
+        SET pending_reclaim_bytes = ?, updated_at = ? WHERE id = ?`, pending-node.Size, millis(s.now()), namespaceID); err != nil {
+		return false, fmt.Errorf("release DOFS SQLite pending reclaim usage: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return false, mapError(err)
 	}
 	return true, nil
+}
+
+func moveUsageToPending(ctx context.Context, tx *sql.Tx, namespaceID string, size int64, now time.Time) error {
+	result, err := tx.ExecContext(ctx, `UPDATE dofs_namespaces
+        SET used_bytes = used_bytes - ?, pending_reclaim_bytes = pending_reclaim_bytes + ?, updated_at = ?
+        WHERE id = ? AND used_bytes >= ?`, size, size, millis(now), namespaceID, size)
+	if err != nil {
+		return fmt.Errorf("detach DOFS SQLite namespace usage: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return errors.New("dofs sqlite: corrupt namespace usage")
+	}
+	return nil
 }
 
 func (s *Store) ListGenerations(ctx context.Context, namespaceID string, inode uint64) ([]dofs.Generation, error) {
@@ -387,6 +437,44 @@ func (s *Store) ListGenerations(ctx context.Context, namespaceID string, inode u
 		}
 	}
 	return result, nil
+}
+
+func (s *Store) DeleteGeneration(ctx context.Context, namespaceID string, inode uint64, number int64) (bool, error) {
+	if err := dofs.ValidateNamespaceID(namespaceID); err != nil {
+		return false, err
+	}
+	if inode == 0 || inode > math.MaxInt64 || number <= 0 {
+		return false, nil
+	}
+	tx, err := s.begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	if err := lockNamespace(ctx, tx, namespaceID); err != nil {
+		return false, err
+	}
+	var current int64
+	if err := tx.QueryRowContext(ctx, `SELECT generation FROM dofs_nodes
+        WHERE namespace_id = ? AND inode = ?`, namespaceID, inode).Scan(&current); err != nil {
+		return false, mapError(err)
+	}
+	if number >= current {
+		return false, dofs.ErrConflict
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM dofs_generations
+        WHERE namespace_id = ? AND inode = ? AND number = ?`, namespaceID, inode, number)
+	if err != nil {
+		return false, mapError(err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, mapError(err)
+	}
+	return affected == 1, nil
 }
 
 func (s *Store) ListState(ctx context.Context, namespaceID string, state dofs.NodeState) ([]dofs.Node, error) {

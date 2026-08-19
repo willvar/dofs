@@ -211,7 +211,7 @@ func (n *fuseNode) Create(ctx context.Context, name string, flags uint32, mode u
 	}
 	childOperations := &fuseNode{backend: n.backend, node: node}
 	child := n.NewInode(ctx, childOperations, stableAttr(node))
-	if err := n.backend.retain(node.Inode); err != nil {
+	if err := n.backend.retain(ctx, node.Inode); err != nil {
 		_ = n.backend.Remove(context.Background(), parent.Inode, name, false)
 		return nil, nil, 0, errno(err)
 	}
@@ -279,7 +279,7 @@ func (n *fuseNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint3
 	if wantsWrite && !n.backend.WritebackEnabled() {
 		return nil, 0, syscall.EROFS
 	}
-	if err := n.backend.retain(node.Inode); err != nil {
+	if err := n.backend.retain(ctx, node.Inode); err != nil {
 		return nil, 0, errno(err)
 	}
 	handle := &fileHandle{backend: n.backend, node: n, metadata: node, writable: wantsWrite, retained: true}
@@ -323,7 +323,7 @@ func (n *fuseNode) Setattr(ctx context.Context, handle fs.FileHandle, input *fus
 		if node.IsDir() || !n.backend.WritebackEnabled() {
 			return syscall.EROFS
 		}
-		if err := n.backend.retain(node.Inode); err != nil {
+		if err := n.backend.retain(ctx, node.Inode); err != nil {
 			return errno(err)
 		}
 		defer func() { _ = n.backend.release(context.Background(), node.Inode) }()
@@ -552,6 +552,9 @@ func Mount(mountpoint string, backend *Backend, options MountOptions) (MountedFi
 	}
 	if options.Writable && !backend.WritebackEnabled() {
 		return nil, errors.New("DOFS writeback is not enabled")
+	}
+	if err := backend.protectMount(context.Background()); err != nil {
+		return nil, err
 	}
 	root, err := backend.GetNode(context.Background(), RootInode)
 	if err != nil {

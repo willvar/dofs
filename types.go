@@ -40,7 +40,9 @@ var (
 	ErrReadOnly          = errors.New("dofs: filesystem is read-only")
 	ErrWriteConflict     = errors.New("dofs: generation changed during writeback")
 	ErrHandleClosed      = errors.New("dofs: write handle is closed")
-	ErrLeaseLost         = errors.New("dofs: writable namespace lease was lost")
+	ErrLeaseLost         = errors.New("dofs: namespace coordination lease was lost")
+	ErrMountBusy         = errors.New("dofs: namespace already has an active mount or reclamation")
+	ErrReclaimBusy       = errors.New("dofs: namespace reclamation is blocked by an active mount")
 )
 
 type NodeState string
@@ -55,8 +57,12 @@ type Namespace struct {
 	WrappedKEK []byte
 	QuotaBytes int64
 	UsedBytes  int64
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	// PendingReclaimBytes is plaintext logical size detached from the live
+	// namespace but not yet purged from object storage. It is an operational
+	// backlog metric, not an exact provider-billed byte count.
+	PendingReclaimBytes int64
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
 }
 
 // Node is the stable metadata representation of a directory entry. Parent is
@@ -208,8 +214,9 @@ type MetadataStore interface {
 	CommitGeneration(context.Context, CommitGenerationRequest) (Node, bool, error)
 	Rename(context.Context, RenameRequest) (Node, *Node, error)
 	Remove(context.Context, RemoveRequest) (Node, error)
-	Purge(context.Context, string, uint64) (bool, error)
+	Purge(context.Context, string, uint64, int64) (bool, error)
 	ListGenerations(context.Context, string, uint64) ([]Generation, error)
+	DeleteGeneration(context.Context, string, uint64, int64) (bool, error)
 	ListState(context.Context, string, NodeState) ([]Node, error)
 	Chmod(context.Context, string, uint64, uint32) (Node, error)
 	ListEvents(context.Context, string, int64, int) ([]Event, error)
@@ -224,6 +231,14 @@ type MetadataStore interface {
 	AcknowledgeExternalUpload(context.Context, string, string) error
 
 	AcquireWriterLease(context.Context, string) (Lease, error)
+	// AcquireMountLease registers the namespace's single live FUSE consumer.
+	// The exclusive mount lease makes that process's open-handle registry
+	// authoritative and excludes external reclamation.
+	AcquireMountLease(context.Context, string) (Lease, error)
+	// AcquireReclaimLease excludes every live FUSE mount for the namespace.
+	// Control-plane mutations remain safe through metadata transactions and
+	// generation CAS while the lease is held.
+	AcquireReclaimLease(context.Context, string) (Lease, error)
 }
 
 // Lease remains valid until Lost closes. A nil Lost channel means that the

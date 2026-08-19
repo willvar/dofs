@@ -221,7 +221,10 @@ func (s *Store) RefreshExternalUpload(ctx context.Context, namespaceID, uploadID
 		return dofs.ExternalUpload{}, dofs.ErrConflict
 	}
 	result, err := s.db.ExecContext(ctx, `UPDATE dofs_external_uploads SET expires_at = ?
-        WHERE namespace_id = ? AND upload_id = ? AND state = 'active' AND expires_at > ?`,
+        WHERE namespace_id = ? AND upload_id = ? AND state = 'active' AND expires_at > ?
+        AND EXISTS(SELECT 1 FROM dofs_nodes
+            WHERE namespace_id = dofs_external_uploads.namespace_id
+            AND inode = dofs_external_uploads.inode AND state IN ('creating', 'ready'))`,
 		millis(expiresAt.UTC()), namespaceID, uploadID, millis(now))
 	if err != nil {
 		return dofs.ExternalUpload{}, err

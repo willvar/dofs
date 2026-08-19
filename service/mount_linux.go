@@ -43,7 +43,7 @@ func MountNamespace(ctx context.Context, cfg config.Config, runtime *Runtime, re
 		return err
 	}
 	backend, err := dofs.NewBackend(ctx, request.NamespaceID, runtime.Metadata, runtime.Objects, runtime.Keys, dofs.BackendOptions{
-		Writable: request.Writable,
+		Writable: request.Writable, Mounted: true,
 	})
 	if err != nil {
 		return err
