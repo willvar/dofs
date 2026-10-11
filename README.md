@@ -222,9 +222,9 @@ prefix. The object cleanup is retryable if interrupted.
 
 A prepared writeback WAL is replayed on the next writable mount. Uncommitted
 dirty state is discarded. A generation CAS loser cannot publish over a newer
-version. Superseded generations are retained for a default 4 hour 15 minute
-read-URL grace and then reclaimed; callers with a different maximum presigned
-GET lifetime can pass an explicit `ReclaimOptions` grace. Explicit permanent
+version. Superseded generations outside the history limit are eligible for
+reclamation on the next pass; callers that deliberately need read-URL
+protection can pass an explicit `ReclaimOptions` grace. Explicit permanent
 deletion invalidates outstanding reads, releases logical quota immediately,
 and queues every generation for physical deletion. `pending_reclaim_bytes` is
 the detached plaintext backlog, not exact provider-billed ciphertext bytes.

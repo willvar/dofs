@@ -254,19 +254,12 @@ func TestReclaimerPrunesSupersededGenerations(t *testing.T) {
 	if _, err := metadata.DeleteGeneration(t.Context(), "tenant-a", node.Inode, node.Generation); !errors.Is(err, dofs.ErrConflict) {
 		t.Fatalf("delete current generation = %v", err)
 	}
-	deferred, err := dofs.ReclaimDeleted(t.Context(), metadata, objects, "tenant-a")
-	if err != nil || deferred.PrunedGenerations != 0 || deferred.DeferredGenerations != 1 {
-		t.Fatalf("presigned-read grace = %#v, %v", deferred, err)
-	}
-	if _, exists := objects.Bytes(first.ObjectKey); !exists {
-		t.Fatal("superseded generation was removed before the read grace elapsed")
-	}
-	result, err := dofs.Reclaim(t.Context(), metadata, objects, "tenant-a", dofs.ReclaimOptions{})
-	if err != nil || result.PrunedGenerations != 1 || result.Purged != 0 {
-		t.Fatalf("generation reclaim = %#v, %v", result, err)
+	result, err := dofs.ReclaimDeleted(t.Context(), metadata, objects, "tenant-a")
+	if err != nil || result.PrunedGenerations != 1 || result.DeferredGenerations != 0 {
+		t.Fatalf("immediate generation reclaim = %#v, %v", result, err)
 	}
 	if _, exists := objects.Bytes(first.ObjectKey); exists {
-		t.Fatal("superseded generation remained")
+		t.Fatal("superseded generation remained after the reclaim pass")
 	}
 	if _, exists := objects.Bytes(secondKey); !exists {
 		t.Fatal("current generation was removed")

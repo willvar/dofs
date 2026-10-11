@@ -839,14 +839,14 @@ func (b *Backend) pruneSuperseded(ctx context.Context, node Node) error {
 	if err != nil {
 		return err
 	}
-	var currentCreatedAt time.Time
+	currentFound := false
 	for _, generation := range generations {
 		if generation.Number == node.Generation {
-			currentCreatedAt = generation.CreatedAt
+			currentFound = true
 			break
 		}
 	}
-	if currentCreatedAt.IsZero() {
+	if !currentFound {
 		return fmt.Errorf("dofs: inode %d current generation %d is missing", node.Inode, node.Generation)
 	}
 	namespace, err := b.metadata.GetNamespace(ctx, b.namespace.ID)
@@ -860,9 +860,6 @@ func (b *Backend) pruneSuperseded(ctx context.Context, node Node) error {
 	retained := make(map[int64]struct{})
 	for index := len(generations) - 1; index >= 0 && int64(len(retained)) < historyLimit; index-- {
 		retained[generations[index].Number] = struct{}{}
-	}
-	if time.Now().UTC().Before(currentCreatedAt.Add(DefaultSupersededGenerationGrace)) {
-		return nil
 	}
 	for _, generation := range generations {
 		if generation.Number >= node.Generation {

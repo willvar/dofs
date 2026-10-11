@@ -7,10 +7,11 @@ import (
 	"time"
 )
 
-// DefaultSupersededGenerationGrace protects browser/object-store read URLs
-// that were issued for the previous immutable generation. Permanent inode
-// deletion is explicit and is not delayed by this grace period.
-const DefaultSupersededGenerationGrace = 4*time.Hour + 15*time.Minute
+// DefaultSupersededGenerationGrace deliberately does not protect already
+// issued browser/object-store read URLs. Once a generation falls outside the
+// namespace history limit, the next reclaim pass may delete it. Callers that
+// explicitly need read-URL protection can pass a non-zero grace to Reclaim.
+const DefaultSupersededGenerationGrace time.Duration = 0
 
 type ReclaimOptions struct {
 	SupersededGenerationGrace time.Duration
@@ -47,10 +48,9 @@ func ReclaimDeleted(
 	})
 }
 
-// Reclaim is ReclaimDeleted with an explicit superseded-generation grace.
-// A zero grace is useful for controlled maintenance and tests; applications
-// issuing presigned reads should use a value at least as long as their maximum
-// read URL lifetime.
+// Reclaim is ReclaimDeleted with an optional explicit superseded-generation
+// grace. The normal application policy is zero: over-limit generations are
+// eligible for deletion on this pass.
 func Reclaim(
 	ctx context.Context,
 	metadata MetadataStore,
