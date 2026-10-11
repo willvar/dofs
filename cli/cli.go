@@ -312,6 +312,8 @@ type namespaceView struct {
 	Label               string    `json:"label"`
 	QuotaBytes          int64     `json:"quota_bytes"`
 	UsedBytes           int64     `json:"used_bytes"`
+	HistoryLimit        int64     `json:"history_limit"`
+	HistoryBytes        int64     `json:"history_bytes"`
 	PendingReclaimBytes int64     `json:"pending_reclaim_bytes"`
 	CreatedAt           time.Time `json:"created_at"`
 	UpdatedAt           time.Time `json:"updated_at"`
@@ -320,7 +322,8 @@ type namespaceView struct {
 func viewNamespace(namespace dofs.Namespace) namespaceView {
 	return namespaceView{
 		ID: namespace.ID, Label: namespace.Label, QuotaBytes: namespace.QuotaBytes,
-		UsedBytes: namespace.UsedBytes, PendingReclaimBytes: namespace.PendingReclaimBytes,
+		UsedBytes: namespace.UsedBytes, HistoryLimit: namespace.HistoryLimit,
+		HistoryBytes: namespace.HistoryBytes, PendingReclaimBytes: namespace.PendingReclaimBytes,
 		CreatedAt: namespace.CreatedAt, UpdatedAt: namespace.UpdatedAt,
 	}
 }

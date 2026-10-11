@@ -220,6 +220,28 @@ func (s *Store) Migrate(ctx context.Context) error {
 		if _, err := tx.ExecContext(ctx, `UPDATE dofs_schema SET version = 3 WHERE singleton = 1`); err != nil {
 			return fmt.Errorf("record DOFS SQLite schema v3: %w", err)
 		}
+		current = 3
+	}
+	if current < 4 {
+		for _, statement := range schemaV4Statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("install DOFS SQLite schema v4: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE dofs_schema SET version = 4 WHERE singleton = 1`); err != nil {
+			return fmt.Errorf("record DOFS SQLite schema v4: %w", err)
+		}
+		current = 4
+	}
+	if current < 5 {
+		for _, statement := range schemaV5Statements {
+			if _, err := tx.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("install DOFS SQLite schema v5: %w", err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE dofs_schema SET version = 5 WHERE singleton = 1`); err != nil {
+			return fmt.Errorf("record DOFS SQLite schema v5: %w", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit DOFS SQLite migration: %w", err)

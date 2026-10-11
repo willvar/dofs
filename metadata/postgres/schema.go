@@ -1,6 +1,6 @@
 package postgres
 
-const schemaVersion = 3
+const schemaVersion = 5
 
 const createSchema = `
 CREATE TABLE IF NOT EXISTS dofs_namespaces (
@@ -114,4 +114,42 @@ FROM (
     GROUP BY namespace_id
 ) AS deleted
 WHERE namespace.id = deleted.namespace_id;
+`
+
+const createHistorySchema = `
+ALTER TABLE dofs_namespaces
+    ADD COLUMN history_limit BIGINT NOT NULL DEFAULT 1 CHECK (history_limit > 0);
+ALTER TABLE dofs_namespaces
+    ADD COLUMN history_bytes BIGINT NOT NULL DEFAULT 0 CHECK (history_bytes >= 0);
+UPDATE dofs_namespaces AS namespace
+SET history_bytes = history.bytes
+FROM (
+    SELECT n.namespace_id, COALESCE(SUM(g.size), 0) AS bytes
+    FROM dofs_nodes n
+    LEFT JOIN dofs_generations g
+      ON g.namespace_id = n.namespace_id
+     AND g.inode = n.inode
+     AND g.number < n.generation
+    GROUP BY n.namespace_id
+) AS history
+WHERE namespace.id = history.namespace_id;
+`
+
+const createGenerationKeySchema = `
+ALTER TABLE dofs_generations
+    ADD COLUMN wrapped_dek BYTEA NOT NULL DEFAULT ''::bytea;
+UPDATE dofs_generations AS generation
+SET wrapped_dek = COALESCE(
+    (SELECT upload.wrapped_dek FROM dofs_external_uploads upload
+     WHERE upload.namespace_id = generation.namespace_id
+       AND upload.inode = generation.inode
+       AND upload.target_generation = generation.number
+     ORDER BY upload.created_at DESC LIMIT 1),
+    (SELECT node.wrapped_dek FROM dofs_nodes node
+     WHERE node.namespace_id = generation.namespace_id
+       AND node.inode = generation.inode
+       AND node.generation = generation.number),
+    ''::bytea
+)
+WHERE octet_length(generation.wrapped_dek) = 0;
 `

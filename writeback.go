@@ -696,6 +696,7 @@ func (s *WriteSession) commitLocked(ctx context.Context) error {
 	current, switched, err := s.manager.backend.metadata.CommitGeneration(ctx, CommitGenerationRequest{
 		NamespaceID: entry.NamespaceID, Inode: entry.Inode,
 		ExpectedGeneration: entry.BaseGeneration, ObjectKey: entry.TargetObjectKey, Size: entry.Size,
+		WrappedDEK: s.node.WrappedDEK,
 	})
 	if errors.Is(err, ErrQuotaExceeded) {
 		return s.discardLocked(ctx, entry, ErrQuotaExceeded)

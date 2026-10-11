@@ -77,6 +77,14 @@ func Reclaim(
 		return result, fmt.Errorf("acquire DOFS reclamation lease: %w", err)
 	}
 	defer lease.Close()
+	namespace, err := metadata.GetNamespace(ctx, namespaceID)
+	if err != nil {
+		return result, fmt.Errorf("load DOFS namespace history policy: %w", err)
+	}
+	historyLimit := namespace.HistoryLimit
+	if historyLimit < DefaultHistoryLimit {
+		historyLimit = DefaultHistoryLimit
+	}
 
 	deleted, err := metadata.ListState(ctx, namespaceID, NodeStateDeleted)
 	if err != nil {
@@ -185,9 +193,16 @@ func Reclaim(
 			))
 			continue
 		}
+		retained := make(map[int64]struct{})
+		for index := len(generations) - 1; index >= 0 && int64(len(retained)) < historyLimit; index-- {
+			retained[generations[index].Number] = struct{}{}
+		}
 		if options.SupersededGenerationGrace > 0 && now.Before(currentCreatedAt.Add(options.SupersededGenerationGrace)) {
 			for _, generation := range generations {
 				if generation.Number < node.Generation {
+					if _, keep := retained[generation.Number]; keep {
+						continue
+					}
 					result.DeferredGenerations++
 				}
 			}
@@ -195,6 +210,9 @@ func Reclaim(
 		}
 		for _, generation := range generations {
 			if generation.Number >= node.Generation {
+				continue
+			}
+			if _, keep := retained[generation.Number]; keep {
 				continue
 			}
 			if leaseErr := requireLiveLease(lease); leaseErr != nil {

@@ -77,6 +77,24 @@ func (s *Store) Migrate(ctx context.Context) error {
 		if _, err := tx.ExecContext(ctx, `UPDATE dofs_schema SET version = 3 WHERE singleton = TRUE`); err != nil {
 			return fmt.Errorf("record DOFS metadata schema v3: %w", err)
 		}
+		current = 3
+	}
+	if current < 4 {
+		if _, err := tx.ExecContext(ctx, createHistorySchema); err != nil {
+			return fmt.Errorf("install DOFS metadata schema v4: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE dofs_schema SET version = 4 WHERE singleton = TRUE`); err != nil {
+			return fmt.Errorf("record DOFS metadata schema v4: %w", err)
+		}
+		current = 4
+	}
+	if current < 5 {
+		if _, err := tx.ExecContext(ctx, createGenerationKeySchema); err != nil {
+			return fmt.Errorf("install DOFS metadata schema v5: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE dofs_schema SET version = 5 WHERE singleton = TRUE`); err != nil {
+			return fmt.Errorf("record DOFS metadata schema v5: %w", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit DOFS schema migration: %w", err)
@@ -91,16 +109,22 @@ func (s *Store) CreateNamespace(ctx context.Context, namespace dofs.Namespace) (
 	if len(namespace.WrappedKEK) == 0 || namespace.QuotaBytes < 0 {
 		return dofs.Namespace{}, dofs.ErrInvalidNamespace
 	}
+	if namespace.HistoryLimit == 0 {
+		namespace.HistoryLimit = dofs.DefaultHistoryLimit
+	}
+	if namespace.HistoryLimit < dofs.DefaultHistoryLimit {
+		return dofs.Namespace{}, dofs.ErrInvalidNamespace
+	}
 	tx, err := s.begin(ctx)
 	if err != nil {
 		return dofs.Namespace{}, err
 	}
 	defer tx.Rollback()
 	row := tx.QueryRowContext(ctx, `
-        INSERT INTO dofs_namespaces(id, label, wrapped_kek, quota_bytes)
-        VALUES ($1, $2, $3, $4)
-        RETURNING id, label, wrapped_kek, quota_bytes, used_bytes, pending_reclaim_bytes, created_at, updated_at`,
-		namespace.ID, namespace.Label, namespace.WrappedKEK, namespace.QuotaBytes,
+		INSERT INTO dofs_namespaces(id, label, wrapped_kek, quota_bytes, history_limit)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING id, label, wrapped_kek, quota_bytes, used_bytes, history_limit, history_bytes, pending_reclaim_bytes, created_at, updated_at`,
+		namespace.ID, namespace.Label, namespace.WrappedKEK, namespace.QuotaBytes, namespace.HistoryLimit,
 	)
 	created, err := scanNamespace(row)
 	if err != nil {
@@ -126,13 +150,43 @@ func (s *Store) GetNamespace(ctx context.Context, id string) (dofs.Namespace, er
 		return dofs.Namespace{}, err
 	}
 	return scanNamespace(s.db.QueryRowContext(ctx, `
-        SELECT id, label, wrapped_kek, quota_bytes, used_bytes, pending_reclaim_bytes, created_at, updated_at
+        SELECT id, label, wrapped_kek, quota_bytes, used_bytes, history_limit, history_bytes, pending_reclaim_bytes, created_at, updated_at
         FROM dofs_namespaces WHERE id = $1`, id))
+}
+
+func (s *Store) SetHistoryLimit(ctx context.Context, namespaceID string, limit int64) (dofs.Namespace, error) {
+	if err := dofs.ValidateNamespaceID(namespaceID); err != nil {
+		return dofs.Namespace{}, err
+	}
+	if limit < dofs.DefaultHistoryLimit {
+		return dofs.Namespace{}, dofs.ErrInvalidNamespace
+	}
+	tx, err := s.begin(ctx)
+	if err != nil {
+		return dofs.Namespace{}, err
+	}
+	defer tx.Rollback()
+	if err := lockNamespace(ctx, tx, namespaceID); err != nil {
+		return dofs.Namespace{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE dofs_namespaces SET history_limit = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $1`, namespaceID, limit); err != nil {
+		return dofs.Namespace{}, mapError(err)
+	}
+	namespace, err := scanNamespace(tx.QueryRowContext(ctx, `
+		SELECT id, label, wrapped_kek, quota_bytes, used_bytes, history_limit, history_bytes, pending_reclaim_bytes, created_at, updated_at
+		FROM dofs_namespaces WHERE id = $1`, namespaceID))
+	if err != nil {
+		return dofs.Namespace{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return dofs.Namespace{}, mapError(err)
+	}
+	return namespace, nil
 }
 
 func (s *Store) ListNamespaces(ctx context.Context) ([]dofs.Namespace, error) {
 	rows, err := s.db.QueryContext(ctx, `
-        SELECT id, label, wrapped_kek, quota_bytes, used_bytes, pending_reclaim_bytes, created_at, updated_at
+        SELECT id, label, wrapped_kek, quota_bytes, used_bytes, history_limit, history_bytes, pending_reclaim_bytes, created_at, updated_at
         FROM dofs_namespaces ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("list DOFS namespaces: %w", err)
@@ -406,7 +460,8 @@ func scanNamespace(row scanner) (dofs.Namespace, error) {
 	var namespace dofs.Namespace
 	err := row.Scan(
 		&namespace.ID, &namespace.Label, &namespace.WrappedKEK, &namespace.QuotaBytes,
-		&namespace.UsedBytes, &namespace.PendingReclaimBytes, &namespace.CreatedAt, &namespace.UpdatedAt,
+		&namespace.UsedBytes, &namespace.HistoryLimit, &namespace.HistoryBytes,
+		&namespace.PendingReclaimBytes, &namespace.CreatedAt, &namespace.UpdatedAt,
 	)
 	if err != nil {
 		return dofs.Namespace{}, mapError(err)

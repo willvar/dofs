@@ -278,19 +278,39 @@ func (s *Store) CommitExternalUpload(ctx context.Context, namespaceID, uploadID 
 		(!upload.CreatesNode && node.State != dofs.NodeStateReady) || !node.IsFile() {
 		return node, false, dofs.ErrConflict
 	}
-	var quota, used int64
-	if err := tx.QueryRowContext(ctx, `SELECT quota_bytes, used_bytes FROM dofs_namespaces WHERE id = ?`, namespaceID).Scan(&quota, &used); err != nil {
+	var quota, used, history, pending int64
+	if err := tx.QueryRowContext(ctx, `SELECT quota_bytes, used_bytes, history_bytes, pending_reclaim_bytes FROM dofs_namespaces WHERE id = ?`, namespaceID).Scan(&quota, &used, &history, &pending); err != nil {
 		return dofs.Node{}, false, mapError(err)
 	}
 	delta := upload.Size - node.Size
-	if delta > 0 && (used > math.MaxInt64-delta || (quota > 0 && delta > quota-used)) {
+	previousSize, previousGeneration := node.Size, node.Generation
+	nextUsed, nextPending, nextHistory := used, pending, history
+	if node.State == dofs.NodeStateDeleted {
+		if (delta < 0 && nextPending < -delta) || (delta > 0 && nextPending > math.MaxInt64-delta) {
+			return dofs.Node{}, false, errors.New("dofs sqlite: corrupt pending reclaim usage")
+		}
+		nextPending += delta
+	} else {
+		if (delta > 0 && nextUsed > math.MaxInt64-delta) || (delta < 0 && nextUsed < -delta) {
+			return dofs.Node{}, false, errors.New("dofs sqlite: corrupt namespace usage")
+		}
+		nextUsed += delta
+	}
+	if previousGeneration > 0 {
+		if nextHistory > math.MaxInt64-previousSize {
+			return dofs.Node{}, false, errors.New("dofs sqlite: namespace history usage overflow")
+		}
+		nextHistory += previousSize
+	}
+	if nextUsed < 0 || nextHistory < 0 || nextUsed > math.MaxInt64-nextHistory ||
+		(quota > 0 && nextUsed+nextHistory > quota) {
 		return node, false, dofs.ErrQuotaExceeded
 	}
 	now := s.now().UTC()
 	if _, err := tx.ExecContext(ctx, `INSERT INTO dofs_generations(
-        namespace_id, inode, number, object_key, size, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?)`, namespaceID, node.Inode, upload.TargetGeneration,
-		upload.ObjectKey, upload.Size, millis(now)); err != nil {
+		namespace_id, inode, number, object_key, size, wrapped_dek, created_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?)`, namespaceID, node.Inode, upload.TargetGeneration,
+		upload.ObjectKey, upload.Size, upload.WrappedDEK, millis(now)); err != nil {
 		return dofs.Node{}, false, mapError(err)
 	}
 	nextState := node.State
@@ -303,8 +323,8 @@ func (s *Store) CommitExternalUpload(ctx context.Context, namespaceID, uploadID 
 		upload.Size, upload.WrappedDEK, nextState, millis(now), millis(now), namespaceID, node.Inode); err != nil {
 		return dofs.Node{}, false, fmt.Errorf("publish DOFS SQLite external upload: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE dofs_namespaces SET used_bytes = ?, updated_at = ? WHERE id = ?`,
-		used+delta, millis(now), namespaceID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE dofs_namespaces SET used_bytes = ?, history_bytes = ?, pending_reclaim_bytes = ?, updated_at = ? WHERE id = ?`,
+		nextUsed, nextHistory, nextPending, millis(now), namespaceID); err != nil {
 		return dofs.Node{}, false, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE dofs_external_uploads SET state = 'committed', committed_at = ?

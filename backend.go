@@ -633,7 +633,7 @@ func (b *Backend) CreateFile(ctx context.Context, parent uint64, name string, mo
 	}
 	committed, ok, err := b.metadata.CommitGeneration(ctx, CommitGenerationRequest{
 		NamespaceID: b.namespace.ID, Inode: node.Inode, ExpectedGeneration: 0,
-		ObjectKey: objectKey, Size: 0,
+		ObjectKey: objectKey, Size: 0, WrappedDEK: wrapped,
 	})
 	if err != nil || !ok {
 		_ = b.objects.Delete(context.Background(), objectKey)
@@ -849,11 +849,26 @@ func (b *Backend) pruneSuperseded(ctx context.Context, node Node) error {
 	if currentCreatedAt.IsZero() {
 		return fmt.Errorf("dofs: inode %d current generation %d is missing", node.Inode, node.Generation)
 	}
+	namespace, err := b.metadata.GetNamespace(ctx, b.namespace.ID)
+	if err != nil {
+		return err
+	}
+	historyLimit := namespace.HistoryLimit
+	if historyLimit < DefaultHistoryLimit {
+		historyLimit = DefaultHistoryLimit
+	}
+	retained := make(map[int64]struct{})
+	for index := len(generations) - 1; index >= 0 && int64(len(retained)) < historyLimit; index-- {
+		retained[generations[index].Number] = struct{}{}
+	}
 	if time.Now().UTC().Before(currentCreatedAt.Add(DefaultSupersededGenerationGrace)) {
 		return nil
 	}
 	for _, generation := range generations {
 		if generation.Number >= node.Generation {
+			continue
+		}
+		if _, keep := retained[generation.Number]; keep {
 			continue
 		}
 		if err := b.objects.Delete(ctx, generation.ObjectKey); err != nil && !errors.Is(err, ErrObjectNotFound) {

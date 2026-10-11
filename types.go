@@ -14,6 +14,9 @@ import (
 
 const (
 	RootInode uint64 = 1
+	// DefaultHistoryLimit keeps the current generation only. Applications can
+	// opt into historical generations by setting a larger namespace limit.
+	DefaultHistoryLimit int64 = 1
 
 	NodeStateCreating NodeState = "creating"
 	NodeStateReady    NodeState = "ready"
@@ -57,6 +60,13 @@ type Namespace struct {
 	WrappedKEK []byte
 	QuotaBytes int64
 	UsedBytes  int64
+	// HistoryLimit is the number of complete generations retained per file,
+	// including the current generation. A value of one disables user-visible
+	// history while preserving the current generation.
+	HistoryLimit int64
+	// HistoryBytes is the logical size of superseded generations that have not
+	// yet been physically reclaimed. It is included in quota accounting.
+	HistoryBytes int64
 	// PendingReclaimBytes is plaintext logical size detached from the live
 	// namespace but not yet purged from object storage. It is an operational
 	// backlog metric, not an exact provider-billed byte count.
@@ -98,7 +108,11 @@ type Generation struct {
 	Number      int64
 	ObjectKey   string
 	Size        int64
-	CreatedAt   time.Time
+	// WrappedDEK is the envelope-encrypted data key used by this immutable
+	// object. Replacements may use a new file key, so it cannot be inferred
+	// from the inode's current Node.WrappedDEK.
+	WrappedDEK []byte
+	CreatedAt  time.Time
 }
 
 type CreateNodeRequest struct {
@@ -116,6 +130,10 @@ type CommitGenerationRequest struct {
 	ExpectedGeneration int64
 	ObjectKey          string
 	Size               int64
+	// WrappedDEK binds the object to its immutable file key. Empty is accepted
+	// for compatibility with metadata callers that keep the inode key stable;
+	// implementations fall back to the current node wrapper in that case.
+	WrappedDEK []byte
 }
 
 type ExternalUploadState string
@@ -205,6 +223,7 @@ type MetadataStore interface {
 	GetNamespace(context.Context, string) (Namespace, error)
 	ListNamespaces(context.Context) ([]Namespace, error)
 	DeleteNamespace(context.Context, string) error
+	SetHistoryLimit(context.Context, string, int64) (Namespace, error)
 
 	GetNode(context.Context, string, uint64) (Node, error)
 	Lookup(context.Context, string, uint64, string) (Node, error)

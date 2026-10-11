@@ -1,6 +1,6 @@
 package sqlite
 
-const schemaVersion = 3
+const schemaVersion = 5
 
 var schemaV1Statements = []string{
 	`CREATE TABLE IF NOT EXISTS dofs_namespaces (
@@ -126,4 +126,33 @@ var schemaV3Statements = []string{
     )`,
 	`CREATE INDEX IF NOT EXISTS dofs_reclamation_leases_namespace_expiry
         ON dofs_reclamation_leases(namespace_id, expires_at, mode)`,
+}
+
+var schemaV4Statements = []string{
+	`ALTER TABLE dofs_namespaces ADD COLUMN history_limit INTEGER NOT NULL DEFAULT 1 CHECK (history_limit > 0)`,
+	`ALTER TABLE dofs_namespaces ADD COLUMN history_bytes INTEGER NOT NULL DEFAULT 0 CHECK (history_bytes >= 0)`,
+	`UPDATE dofs_namespaces
+		SET history_bytes = (
+			SELECT COALESCE(SUM(g.size), 0)
+			FROM dofs_generations g
+			JOIN dofs_nodes n ON n.namespace_id = g.namespace_id AND n.inode = g.inode
+			WHERE g.namespace_id = dofs_namespaces.id AND g.number < n.generation
+		)`,
+}
+
+var schemaV5Statements = []string{
+	`ALTER TABLE dofs_generations ADD COLUMN wrapped_dek BLOB NOT NULL DEFAULT X''`,
+	`UPDATE dofs_generations AS generation
+		SET wrapped_dek = COALESCE(
+			(SELECT upload.wrapped_dek FROM dofs_external_uploads upload
+			 WHERE upload.namespace_id = generation.namespace_id
+			   AND upload.inode = generation.inode
+			   AND upload.target_generation = generation.number
+			 ORDER BY upload.created_at DESC LIMIT 1),
+			(SELECT node.wrapped_dek FROM dofs_nodes node
+			 WHERE node.namespace_id = generation.namespace_id
+			   AND node.inode = generation.inode
+			   AND node.generation = generation.number),
+			X''
+		) WHERE length(generation.wrapped_dek) = 0`,
 }

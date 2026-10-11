@@ -42,19 +42,24 @@ func (s *Store) CommitGeneration(ctx context.Context, request dofs.CommitGenerat
 	if node.Generation != request.ExpectedGeneration {
 		return node, false, nil
 	}
-	var quota, used, pending int64
-	if err := tx.QueryRowContext(ctx, `SELECT quota_bytes, used_bytes, pending_reclaim_bytes FROM dofs_namespaces WHERE id = $1`, request.NamespaceID).Scan(&quota, &used, &pending); err != nil {
+	var quota, used, history, pending int64
+	if err := tx.QueryRowContext(ctx, `SELECT quota_bytes, used_bytes, history_bytes, pending_reclaim_bytes FROM dofs_namespaces WHERE id = $1`, request.NamespaceID).Scan(&quota, &used, &history, &pending); err != nil {
 		return dofs.Node{}, false, mapError(err)
 	}
 	delta := request.Size - node.Size
-	if delta > 0 && (used > math.MaxInt64-delta || (quota > 0 && delta > quota-used)) {
-		return node, false, dofs.ErrQuotaExceeded
+	previousSize, previousGeneration := node.Size, node.Generation
+	if node.Generation == math.MaxInt64 {
+		return node, false, errors.New("dofs: generation space exhausted")
 	}
 	nextGeneration := node.Generation + 1
+	wrappedDEK := request.WrappedDEK
+	if len(wrappedDEK) == 0 {
+		wrappedDEK = node.WrappedDEK
+	}
 	if _, err := tx.ExecContext(ctx, `
-        INSERT INTO dofs_generations(namespace_id, inode, number, object_key, size)
-        VALUES ($1, $2, $3, $4, $5)`,
-		request.NamespaceID, request.Inode, nextGeneration, request.ObjectKey, request.Size,
+		INSERT INTO dofs_generations(namespace_id, inode, number, object_key, size, wrapped_dek)
+		VALUES ($1, $2, $3, $4, $5, $6)`,
+		request.NamespaceID, request.Inode, nextGeneration, request.ObjectKey, request.Size, wrappedDEK,
 	); err != nil {
 		return dofs.Node{}, false, mapError(err)
 	}
@@ -65,16 +70,16 @@ func (s *Store) CommitGeneration(ctx context.Context, request dofs.CommitGenerat
 	}
 	node, err = scanNode(tx.QueryRowContext(ctx, `
         UPDATE dofs_nodes
-        SET generation = $3, object_key = $4, size = $5, state = $6,
-            modified_at = CURRENT_TIMESTAMP, changed_at = CURRENT_TIMESTAMP
+		SET generation = $3, object_key = $4, size = $5, wrapped_dek = $6, state = $7,
+			modified_at = CURRENT_TIMESTAMP, changed_at = CURRENT_TIMESTAMP
         WHERE namespace_id = $1 AND inode = $2
         RETURNING `+nodeColumns,
-		request.NamespaceID, request.Inode, nextGeneration, request.ObjectKey, request.Size, nextState,
+		request.NamespaceID, request.Inode, nextGeneration, request.ObjectKey, request.Size, wrappedDEK, nextState,
 	))
 	if err != nil {
 		return dofs.Node{}, false, err
 	}
-	nextUsed, nextPending := used, pending
+	nextUsed, nextPending, nextHistory := used, pending, history
 	if node.State == dofs.NodeStateDeleted {
 		if (delta < 0 && pending < -delta) || (delta > 0 && pending > math.MaxInt64-delta) {
 			return dofs.Node{}, false, errors.New("dofs: corrupt pending reclaim usage")
@@ -86,10 +91,20 @@ func (s *Store) CommitGeneration(ctx context.Context, request dofs.CommitGenerat
 		}
 		nextUsed = used + delta
 	}
+	if previousGeneration > 0 {
+		if nextHistory > math.MaxInt64-previousSize {
+			return dofs.Node{}, false, errors.New("dofs: namespace history usage overflow")
+		}
+		nextHistory += previousSize
+	}
+	if nextUsed < 0 || nextHistory < 0 || nextUsed > math.MaxInt64-nextHistory ||
+		(quota > 0 && nextUsed+nextHistory > quota) {
+		return node, false, dofs.ErrQuotaExceeded
+	}
 	if _, err := tx.ExecContext(ctx, `
         UPDATE dofs_namespaces
-        SET used_bytes = $2, pending_reclaim_bytes = $3, updated_at = CURRENT_TIMESTAMP
-        WHERE id = $1`, request.NamespaceID, nextUsed, nextPending); err != nil {
+		SET used_bytes = $2, history_bytes = $3, pending_reclaim_bytes = $4, updated_at = CURRENT_TIMESTAMP
+		WHERE id = $1`, request.NamespaceID, nextUsed, nextHistory, nextPending); err != nil {
 		return dofs.Node{}, false, fmt.Errorf("update DOFS namespace usage: %w", err)
 	}
 	kind := dofs.EventWrite
@@ -349,13 +364,25 @@ func (s *Store) Purge(ctx context.Context, namespaceID string, inode uint64, exp
 			return false, dofs.ErrDirectoryNotEmpty
 		}
 	}
+	var historyBytes, namespaceHistory int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(size), 0) FROM dofs_generations
+		WHERE namespace_id = $1 AND inode = $2 AND number < $3`, namespaceID, inode, node.Generation).Scan(&historyBytes); err != nil {
+		return false, err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT history_bytes FROM dofs_namespaces WHERE id = $1`, namespaceID).Scan(&namespaceHistory); err != nil {
+		return false, mapError(err)
+	}
+	if namespaceHistory < historyBytes {
+		return false, errors.New("dofs: corrupt namespace history usage")
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM dofs_nodes WHERE namespace_id = $1 AND inode = $2`, namespaceID, inode); err != nil {
 		return false, fmt.Errorf("purge DOFS inode: %w", err)
 	}
 	result, err := tx.ExecContext(ctx, `
         UPDATE dofs_namespaces
-        SET pending_reclaim_bytes = pending_reclaim_bytes - $2, updated_at = CURRENT_TIMESTAMP
-        WHERE id = $1 AND pending_reclaim_bytes >= $2`, namespaceID, node.Size)
+		SET history_bytes = history_bytes - $3,
+		    pending_reclaim_bytes = pending_reclaim_bytes - $2, updated_at = CURRENT_TIMESTAMP
+		WHERE id = $1 AND pending_reclaim_bytes >= $2 AND history_bytes >= $3`, namespaceID, node.Size, historyBytes)
 	if err != nil {
 		return false, fmt.Errorf("release DOFS pending reclaim usage: %w", err)
 	}
@@ -399,8 +426,8 @@ func (s *Store) ListGenerations(ctx context.Context, namespaceID string, inode u
 		return nil, dofs.ErrNotFound
 	}
 	rows, err := s.db.QueryContext(ctx, `
-        SELECT namespace_id, inode, number, object_key, size, created_at
-        FROM dofs_generations WHERE namespace_id = $1 AND inode = $2 ORDER BY number`, namespaceID, inode)
+		SELECT namespace_id, inode, number, object_key, size, wrapped_dek, created_at
+		FROM dofs_generations WHERE namespace_id = $1 AND inode = $2 ORDER BY number`, namespaceID, inode)
 	if err != nil {
 		return nil, fmt.Errorf("list DOFS generations: %w", err)
 	}
@@ -410,7 +437,7 @@ func (s *Store) ListGenerations(ctx context.Context, namespaceID string, inode u
 		var generation dofs.Generation
 		if err := rows.Scan(
 			&generation.NamespaceID, &generation.Inode, &generation.Number,
-			&generation.ObjectKey, &generation.Size, &generation.CreatedAt,
+			&generation.ObjectKey, &generation.Size, &generation.WrappedDEK, &generation.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan DOFS generation: %w", err)
 		}
@@ -454,6 +481,14 @@ func (s *Store) DeleteGeneration(ctx context.Context, namespaceID string, inode 
 	if number >= current {
 		return false, dofs.ErrConflict
 	}
+	var size int64
+	if err := tx.QueryRowContext(ctx, `SELECT size FROM dofs_generations
+		WHERE namespace_id = $1 AND inode = $2 AND number = $3`, namespaceID, inode, number).Scan(&size); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, mapError(err)
+	}
 	result, err := tx.ExecContext(ctx, `DELETE FROM dofs_generations
         WHERE namespace_id = $1 AND inode = $2 AND number = $3`, namespaceID, inode, number)
 	if err != nil {
@@ -462,6 +497,21 @@ func (s *Store) DeleteGeneration(ctx context.Context, namespaceID string, inode 
 	affected, err := result.RowsAffected()
 	if err != nil {
 		return false, err
+	}
+	if affected == 1 {
+		result, err := tx.ExecContext(ctx, `UPDATE dofs_namespaces
+			SET history_bytes = history_bytes - $2, updated_at = CURRENT_TIMESTAMP
+			WHERE id = $1 AND history_bytes >= $2`, namespaceID, size)
+		if err != nil {
+			return false, fmt.Errorf("update DOFS history usage: %w", err)
+		}
+		updated, updateErr := result.RowsAffected()
+		if updateErr != nil {
+			return false, updateErr
+		}
+		if updated != 1 {
+			return false, errors.New("dofs: corrupt namespace history usage")
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return false, mapError(err)

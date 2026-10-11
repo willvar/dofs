@@ -40,23 +40,25 @@ func (s *Store) CommitGeneration(ctx context.Context, request dofs.CommitGenerat
 	if node.Generation != request.ExpectedGeneration {
 		return node, false, nil
 	}
-	var quota, used, pending int64
-	if err := tx.QueryRowContext(ctx, `SELECT quota_bytes, used_bytes, pending_reclaim_bytes FROM dofs_namespaces WHERE id = ?`, request.NamespaceID).Scan(&quota, &used, &pending); err != nil {
+	var quota, used, history, pending int64
+	if err := tx.QueryRowContext(ctx, `SELECT quota_bytes, used_bytes, history_bytes, pending_reclaim_bytes FROM dofs_namespaces WHERE id = ?`, request.NamespaceID).Scan(&quota, &used, &history, &pending); err != nil {
 		return dofs.Node{}, false, mapError(err)
 	}
 	delta := request.Size - node.Size
-	if delta > 0 && (used > math.MaxInt64-delta || (quota > 0 && delta > quota-used)) {
-		return node, false, dofs.ErrQuotaExceeded
-	}
+	previousSize, previousGeneration := node.Size, node.Generation
 	if node.Generation == math.MaxInt64 {
 		return node, false, errors.New("dofs sqlite: generation space exhausted")
 	}
 	nextGeneration := node.Generation + 1
 	now := s.now().UTC()
+	wrappedDEK := request.WrappedDEK
+	if len(wrappedDEK) == 0 {
+		wrappedDEK = node.WrappedDEK
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO dofs_generations(
-        namespace_id, inode, number, object_key, size, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?)`,
-		request.NamespaceID, request.Inode, nextGeneration, request.ObjectKey, request.Size, millis(now),
+        namespace_id, inode, number, object_key, size, wrapped_dek, created_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		request.NamespaceID, request.Inode, nextGeneration, request.ObjectKey, request.Size, wrappedDEK, millis(now),
 	); err != nil {
 		return dofs.Node{}, false, mapError(err)
 	}
@@ -67,31 +69,42 @@ func (s *Store) CommitGeneration(ctx context.Context, request dofs.CommitGenerat
 	node.Generation = nextGeneration
 	node.ObjectKey = request.ObjectKey
 	node.Size = request.Size
+	node.WrappedDEK = append([]byte(nil), wrappedDEK...)
 	node.ModifiedAt = now
 	node.ChangedAt = now
 	if _, err := tx.ExecContext(ctx, `UPDATE dofs_nodes
-        SET generation = ?, object_key = ?, size = ?, state = ?, modified_at = ?, changed_at = ?
-        WHERE namespace_id = ? AND inode = ?`,
-		node.Generation, node.ObjectKey, node.Size, node.State, millis(now), millis(now),
+		SET generation = ?, object_key = ?, size = ?, wrapped_dek = ?, state = ?, modified_at = ?, changed_at = ?
+		WHERE namespace_id = ? AND inode = ?`,
+		node.Generation, node.ObjectKey, node.Size, wrappedDEK, node.State, millis(now), millis(now),
 		request.NamespaceID, request.Inode,
 	); err != nil {
 		return dofs.Node{}, false, fmt.Errorf("advance DOFS SQLite generation: %w", err)
 	}
-	nextUsed, nextPending := used, pending
+	nextUsed, nextPending, nextHistory := used, pending, history
 	if node.State == dofs.NodeStateDeleted {
 		if (delta < 0 && pending < -delta) || (delta > 0 && pending > math.MaxInt64-delta) {
 			return dofs.Node{}, false, errors.New("dofs sqlite: corrupt pending reclaim usage")
 		}
 		nextPending = pending + delta
 	} else {
-		if delta < 0 && used < -delta {
+		if (delta > 0 && used > math.MaxInt64-delta) || (delta < 0 && used < -delta) {
 			return dofs.Node{}, false, errors.New("dofs sqlite: corrupt namespace usage")
 		}
 		nextUsed = used + delta
 	}
+	if previousGeneration > 0 {
+		if nextHistory > math.MaxInt64-previousSize {
+			return dofs.Node{}, false, errors.New("dofs sqlite: namespace history usage overflow")
+		}
+		nextHistory += previousSize
+	}
+	if nextUsed < 0 || nextHistory < 0 || nextUsed > math.MaxInt64-nextHistory ||
+		(quota > 0 && nextUsed+nextHistory > quota) {
+		return node, false, dofs.ErrQuotaExceeded
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE dofs_namespaces
-        SET used_bytes = ?, pending_reclaim_bytes = ?, updated_at = ? WHERE id = ?`,
-		nextUsed, nextPending, millis(now), request.NamespaceID); err != nil {
+		SET used_bytes = ?, history_bytes = ?, pending_reclaim_bytes = ?, updated_at = ? WHERE id = ?`,
+		nextUsed, nextHistory, nextPending, millis(now), request.NamespaceID); err != nil {
 		return dofs.Node{}, false, fmt.Errorf("update DOFS SQLite namespace usage: %w", err)
 	}
 	kind := dofs.EventWrite
@@ -368,11 +381,24 @@ func (s *Store) Purge(ctx context.Context, namespaceID string, inode uint64, exp
 	if pending < node.Size {
 		return false, errors.New("dofs sqlite: corrupt pending reclaim usage")
 	}
+	var historyBytes int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(size), 0) FROM dofs_generations
+		WHERE namespace_id = ? AND inode = ? AND number < ?`, namespaceID, inode, node.Generation).Scan(&historyBytes); err != nil {
+		return false, err
+	}
+	var namespaceHistory int64
+	if err := tx.QueryRowContext(ctx, `SELECT history_bytes FROM dofs_namespaces WHERE id = ?`, namespaceID).Scan(&namespaceHistory); err != nil {
+		return false, mapError(err)
+	}
+	if namespaceHistory < historyBytes {
+		return false, errors.New("dofs sqlite: corrupt namespace history usage")
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM dofs_nodes WHERE namespace_id = ? AND inode = ?`, namespaceID, inode); err != nil {
 		return false, fmt.Errorf("purge DOFS SQLite inode: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE dofs_namespaces
-        SET pending_reclaim_bytes = ?, updated_at = ? WHERE id = ?`, pending-node.Size, millis(s.now()), namespaceID); err != nil {
+		SET history_bytes = ?, pending_reclaim_bytes = ?, updated_at = ? WHERE id = ?`,
+		namespaceHistory-historyBytes, pending-node.Size, millis(s.now()), namespaceID); err != nil {
 		return false, fmt.Errorf("release DOFS SQLite pending reclaim usage: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -405,7 +431,7 @@ func (s *Store) ListGenerations(ctx context.Context, namespaceID string, inode u
 	if inode == 0 || inode > math.MaxInt64 {
 		return nil, dofs.ErrNotFound
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT namespace_id, inode, number, object_key, size, created_at
+	rows, err := s.db.QueryContext(ctx, `SELECT namespace_id, inode, number, object_key, size, wrapped_dek, created_at
         FROM dofs_generations WHERE namespace_id = ? AND inode = ? ORDER BY number`, namespaceID, inode)
 	if err != nil {
 		return nil, fmt.Errorf("list DOFS SQLite generations: %w", err)
@@ -417,7 +443,7 @@ func (s *Store) ListGenerations(ctx context.Context, namespaceID string, inode u
 		var inodeValue, createdAt int64
 		if err := rows.Scan(
 			&generation.NamespaceID, &inodeValue, &generation.Number,
-			&generation.ObjectKey, &generation.Size, &createdAt,
+			&generation.ObjectKey, &generation.Size, &generation.WrappedDEK, &createdAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan DOFS SQLite generation: %w", err)
 		}
@@ -462,6 +488,14 @@ func (s *Store) DeleteGeneration(ctx context.Context, namespaceID string, inode 
 	if number >= current {
 		return false, dofs.ErrConflict
 	}
+	var size int64
+	if err := tx.QueryRowContext(ctx, `SELECT size FROM dofs_generations
+		WHERE namespace_id = ? AND inode = ? AND number = ?`, namespaceID, inode, number).Scan(&size); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, mapError(err)
+	}
 	result, err := tx.ExecContext(ctx, `DELETE FROM dofs_generations
         WHERE namespace_id = ? AND inode = ? AND number = ?`, namespaceID, inode, number)
 	if err != nil {
@@ -470,6 +504,21 @@ func (s *Store) DeleteGeneration(ctx context.Context, namespaceID string, inode 
 	affected, err := result.RowsAffected()
 	if err != nil {
 		return false, err
+	}
+	if affected == 1 {
+		result, err := tx.ExecContext(ctx, `UPDATE dofs_namespaces
+			SET history_bytes = history_bytes - ?, updated_at = ?
+			WHERE id = ? AND history_bytes >= ?`, size, millis(s.now().UTC()), namespaceID, size)
+		if err != nil {
+			return false, fmt.Errorf("update DOFS SQLite history usage: %w", err)
+		}
+		updated, updateErr := result.RowsAffected()
+		if updateErr != nil {
+			return false, updateErr
+		}
+		if updated != 1 {
+			return false, errors.New("dofs sqlite: corrupt namespace history usage")
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return false, mapError(err)

@@ -58,6 +58,11 @@ func cloneNode(value dofs.Node) dofs.Node {
 	return value
 }
 
+func cloneGeneration(value dofs.Generation) dofs.Generation {
+	value.WrappedDEK = cloneBytes(value.WrappedDEK)
+	return value
+}
+
 func cloneExternalUpload(value dofs.ExternalUpload) dofs.ExternalUpload {
 	value.WrappedDEK = cloneBytes(value.WrappedDEK)
 	if value.CommittedAt != nil {
@@ -77,6 +82,12 @@ func (s *Store) CreateNamespace(ctx context.Context, namespace dofs.Namespace) (
 	if len(namespace.WrappedKEK) == 0 || namespace.QuotaBytes < 0 {
 		return dofs.Namespace{}, dofs.ErrInvalidNamespace
 	}
+	if namespace.HistoryLimit == 0 {
+		namespace.HistoryLimit = dofs.DefaultHistoryLimit
+	}
+	if namespace.HistoryLimit < dofs.DefaultHistoryLimit {
+		return dofs.Namespace{}, dofs.ErrInvalidNamespace
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, exists := s.namespaces[namespace.ID]; exists {
@@ -84,6 +95,7 @@ func (s *Store) CreateNamespace(ctx context.Context, namespace dofs.Namespace) (
 	}
 	now := s.now()
 	namespace.UsedBytes = 0
+	namespace.HistoryBytes = 0
 	namespace.PendingReclaimBytes = 0
 	namespace.CreatedAt = now
 	namespace.UpdatedAt = now
@@ -112,6 +124,24 @@ func (s *Store) GetNamespace(ctx context.Context, id string) (dofs.Namespace, er
 	if err != nil {
 		return dofs.Namespace{}, err
 	}
+	return cloneNamespace(state.namespace), nil
+}
+
+func (s *Store) SetHistoryLimit(ctx context.Context, namespaceID string, limit int64) (dofs.Namespace, error) {
+	if err := contextError(ctx); err != nil {
+		return dofs.Namespace{}, err
+	}
+	if limit < dofs.DefaultHistoryLimit {
+		return dofs.Namespace{}, dofs.ErrInvalidNamespace
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, err := s.namespaceLocked(namespaceID)
+	if err != nil {
+		return dofs.Namespace{}, err
+	}
+	state.namespace.HistoryLimit = limit
+	state.namespace.UpdatedAt = s.now()
 	return cloneNamespace(state.namespace), nil
 }
 
@@ -312,11 +342,10 @@ func (s *Store) CommitGeneration(ctx context.Context, request dofs.CommitGenerat
 	if node.Generation != request.ExpectedGeneration {
 		return cloneNode(node), false, nil
 	}
-	delta := request.Size - node.Size
-	if delta > 0 && (state.namespace.UsedBytes > math.MaxInt64-delta ||
-		(state.namespace.QuotaBytes > 0 && delta > state.namespace.QuotaBytes-state.namespace.UsedBytes)) {
-		return cloneNode(node), false, dofs.ErrQuotaExceeded
+	if node.Generation == math.MaxInt64 {
+		return cloneNode(node), false, errors.New("dofs: generation space exhausted")
 	}
+	delta := request.Size - node.Size
 	nextUsed, nextPending := state.namespace.UsedBytes, state.namespace.PendingReclaimBytes
 	if node.State == dofs.NodeStateDeleted {
 		if (delta < 0 && nextPending < -delta) || (delta > 0 && nextPending > math.MaxInt64-delta) {
@@ -324,15 +353,31 @@ func (s *Store) CommitGeneration(ctx context.Context, request dofs.CommitGenerat
 		}
 		nextPending += delta
 	} else {
-		if delta < 0 && nextUsed < -delta {
+		if (delta > 0 && nextUsed > math.MaxInt64-delta) || (delta < 0 && nextUsed < -delta) {
 			return dofs.Node{}, false, errors.New("dofs: corrupt namespace usage")
 		}
 		nextUsed += delta
+	}
+	nextHistory := state.namespace.HistoryBytes
+	if node.Generation > 0 {
+		if nextHistory > math.MaxInt64-node.Size {
+			return dofs.Node{}, false, errors.New("dofs: namespace history usage overflow")
+		}
+		nextHistory += node.Size
+	}
+	if nextUsed < 0 || nextHistory < 0 || nextUsed > math.MaxInt64-nextHistory ||
+		(state.namespace.QuotaBytes > 0 && nextUsed+nextHistory > state.namespace.QuotaBytes) {
+		return cloneNode(node), false, dofs.ErrQuotaExceeded
+	}
+	wrappedDEK := request.WrappedDEK
+	if len(wrappedDEK) == 0 {
+		wrappedDEK = node.WrappedDEK
 	}
 	now := s.now()
 	node.Generation++
 	node.ObjectKey = request.ObjectKey
 	node.Size = request.Size
+	node.WrappedDEK = cloneBytes(wrappedDEK)
 	node.ModifiedAt = now
 	node.ChangedAt = now
 	wasCreating := node.State == dofs.NodeStateCreating
@@ -341,11 +386,12 @@ func (s *Store) CommitGeneration(ctx context.Context, request dofs.CommitGenerat
 	}
 	state.nodes[node.Inode] = node
 	state.namespace.UsedBytes = nextUsed
+	state.namespace.HistoryBytes = nextHistory
 	state.namespace.PendingReclaimBytes = nextPending
 	state.namespace.UpdatedAt = now
 	generation := dofs.Generation{
 		NamespaceID: node.NamespaceID, Inode: node.Inode, Number: node.Generation,
-		ObjectKey: node.ObjectKey, Size: node.Size, CreatedAt: now,
+		ObjectKey: node.ObjectKey, Size: node.Size, WrappedDEK: cloneBytes(node.WrappedDEK), CreatedAt: now,
 	}
 	state.generations[node.Inode] = append(state.generations[node.Inode], generation)
 	kind := dofs.EventWrite
@@ -577,8 +623,27 @@ func (s *Store) CommitExternalUpload(ctx context.Context, namespaceID, uploadID 
 		return cloneNode(node), false, dofs.ErrConflict
 	}
 	delta := upload.Size - node.Size
-	if delta > 0 && (state.namespace.UsedBytes > math.MaxInt64-delta ||
-		(state.namespace.QuotaBytes > 0 && delta > state.namespace.QuotaBytes-state.namespace.UsedBytes)) {
+	nextUsed, nextPending := state.namespace.UsedBytes, state.namespace.PendingReclaimBytes
+	if node.State == dofs.NodeStateDeleted {
+		if (delta > 0 && nextPending > math.MaxInt64-delta) || (delta < 0 && nextPending < -delta) {
+			return cloneNode(node), false, dofs.ErrQuotaExceeded
+		}
+		nextPending += delta
+	} else {
+		if (delta > 0 && nextUsed > math.MaxInt64-delta) || (delta < 0 && nextUsed < -delta) {
+			return cloneNode(node), false, dofs.ErrQuotaExceeded
+		}
+		nextUsed += delta
+	}
+	nextHistory := state.namespace.HistoryBytes
+	if node.Generation > 0 {
+		if nextHistory > math.MaxInt64-node.Size {
+			return dofs.Node{}, false, errors.New("dofs: namespace history usage overflow")
+		}
+		nextHistory += node.Size
+	}
+	if nextUsed < 0 || nextHistory < 0 || nextUsed > math.MaxInt64-nextHistory ||
+		(state.namespace.QuotaBytes > 0 && nextUsed+nextHistory > state.namespace.QuotaBytes) {
 		return cloneNode(node), false, dofs.ErrQuotaExceeded
 	}
 	now := s.now()
@@ -592,11 +657,13 @@ func (s *Store) CommitExternalUpload(ctx context.Context, namespaceID, uploadID 
 		node.State = dofs.NodeStateReady
 	}
 	state.nodes[node.Inode] = node
-	state.namespace.UsedBytes += delta
+	state.namespace.UsedBytes = nextUsed
+	state.namespace.HistoryBytes = nextHistory
+	state.namespace.PendingReclaimBytes = nextPending
 	state.namespace.UpdatedAt = now
 	state.generations[node.Inode] = append(state.generations[node.Inode], dofs.Generation{
 		NamespaceID: node.NamespaceID, Inode: node.Inode, Number: node.Generation,
-		ObjectKey: node.ObjectKey, Size: node.Size, CreatedAt: now,
+		ObjectKey: node.ObjectKey, Size: node.Size, WrappedDEK: cloneBytes(node.WrappedDEK), CreatedAt: now,
 	})
 	upload.State = dofs.ExternalUploadCommitted
 	upload.CommittedAt = &now
@@ -826,7 +893,21 @@ func (s *Store) Purge(ctx context.Context, namespaceID string, inode uint64, exp
 	if state.namespace.PendingReclaimBytes < node.Size {
 		return false, errors.New("dofs: corrupt pending reclaim usage")
 	}
+	var historyBytes int64
+	for _, generation := range state.generations[inode] {
+		if generation.Number >= node.Generation {
+			continue
+		}
+		if historyBytes > math.MaxInt64-generation.Size {
+			return false, errors.New("dofs: namespace history usage overflow")
+		}
+		historyBytes += generation.Size
+	}
+	if state.namespace.HistoryBytes < historyBytes {
+		return false, errors.New("dofs: corrupt namespace history usage")
+	}
 	state.namespace.PendingReclaimBytes -= node.Size
+	state.namespace.HistoryBytes -= historyBytes
 	state.namespace.UpdatedAt = s.now()
 	delete(state.generations, inode)
 	delete(state.children, inode)
@@ -848,7 +929,10 @@ func (s *Store) ListGenerations(ctx context.Context, namespaceID string, inode u
 		return nil, dofs.ErrNotFound
 	}
 	values := state.generations[inode]
-	result := append([]dofs.Generation(nil), values...)
+	result := make([]dofs.Generation, len(values))
+	for index, value := range values {
+		result[index] = cloneGeneration(value)
+	}
 	sort.Slice(result, func(first, second int) bool { return result[first].Number < result[second].Number })
 	return result, nil
 }
@@ -878,7 +962,12 @@ func (s *Store) DeleteGeneration(ctx context.Context, namespaceID string, inode 
 		if generation.Number != number {
 			continue
 		}
+		if state.namespace.HistoryBytes < generation.Size {
+			return false, errors.New("dofs: corrupt namespace history usage")
+		}
 		state.generations[inode] = append(values[:index], values[index+1:]...)
+		state.namespace.HistoryBytes -= generation.Size
+		state.namespace.UpdatedAt = s.now()
 		return true, nil
 	}
 	return false, nil
